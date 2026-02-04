@@ -37,13 +37,13 @@ E_C2  = charging_energy_ghz(C_J2)
 E_C_r = charging_energy_ghz(C_r)
 
 print("Energy parameters (GHz):")
-print(f"  E_J1  = {E_J1:.4f}")
-print(f"  E_J2  = {E_J2:.4f}")
-print(f"  E_C1  = {E_C1:.4f}")
-print(f"  E_C2  = {E_C2:.4f}")
-print(f"  E_L_c = {E_L_c:.4f}")
-print(f"  E_L_r = {E_L_r:.4f}")
-print(f"  E_C_r = {E_C_r:.4f}")
+print(f"E_J1 = {E_J1:.4f}")
+print(f"E_J2 = {E_J2:.4f}")
+print(f"E_C1 = {E_C1:.4f}")
+print(f"E_C2 = {E_C2:.4f}")
+print(f"E_L_c = {E_L_c:.4f}")
+print(f"E_L_r = {E_L_r:.4f}")
+print(f"E_C_r = {E_C_r:.4f}")
 
 iMET_yaml = f"""# iMET
 branches:
@@ -81,7 +81,7 @@ evals_rel = evals - evals[0]
 
 print("\nLowest energies (GHz, shifted):")
 for k, Ek in enumerate(evals_rel):
-    print(f"  |{k:2d}>  {Ek:.6f} GHz")
+    print(f"|{k:2d}> : {Ek:.6f} GHz")
 
 f01 = evals_rel[1] - evals_rel[0]
 f12 = evals_rel[2] - evals_rel[1]
@@ -94,9 +94,9 @@ f_res_bare = omega_r / (2 * np.pi) / 1e9    # GHz
 detuning = f01 - f_res_bare
 
 print("\nTransitions & nonlinearities (GHz):")
-print(f"  f01 (ground→1)         = {f01:.6f}")
-print(f"  f12 (1→2)              = {f12:.6f}")
-print(f"  anharmonicity α=f12-f01 = {anharmonicity:.6f}")
+print(f"f01 (ground→1) = {f01:.6f}")
+print(f"f12 (1 → 2) = {f12:.6f}")
+print(f"anharmonicity α=f12-f01 = {anharmonicity:.6f}")
 print("\nResonator & dispersive quantities (GHz):")
-print(f"  bare resonator f_r     = {f_res_bare:.6f}")
-print(f"  detuning Δ = f01 - f_r = {detuning:.6f}")
+print(f"bare resonator f_r = {f_res_bare:.6f}")
+print(f"detuning Δ = f01 - f_r = {detuning:.6f}")

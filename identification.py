@@ -119,10 +119,10 @@ assign_chi   = assign_labels_2mode(evals_rel, params, include_chi=True)
 
 print("\n[Fitted effective 2-mode parameters] (GHz)")
 _r_src = " (fixed)" if OMEGA_R_KNOWN is not None else " (from circuit bare f_r)"
-print(f"  omega_r = {params['omega_r']:.6f}" + _r_src)
-print(f"  omega_q ≈ {params['omega_q']:.6f}")
-print(f"  alpha_q ≈ {params['alpha_q']:.6f}")
-print(f"  chi_qr  ≈ {params['chi_qr']:.6f}   (effective dispersive/hybridization shift)")
+print(f"omega_r = {params['omega_r']:.6f}" + _r_src)
+print(f"omega_q ≈ {params['omega_q']:.6f}")
+print(f"alpha_q ≈ {params['alpha_q']:.6f}")
+print(f"chi_qr ≈ {params['chi_qr']:.6f} (effective dispersive/hybridization shift)")
 
 def _pretty_print(assignments, title):
     print(f"\n{title}")
@@ -130,8 +130,8 @@ def _pretty_print(assignments, title):
     for a in assignments:
         print(f"  |{a['k']:2d}>  {a['E']:11.6f}   |{a['nq']},{a['nr']}>   {a['E_pred']:11.6f}    {1e3*a['resid']:8.2f}")
 
-_pretty_print(assign_nochi, "[Labeling using Kerr + harmonic only (no chi_qr)]")
-_pretty_print(assign_chi,   "[Labeling using Kerr + harmonic + effective chi_qr]")
+_pretty_print(assign_nochi,"[Labeling using Kerr + harmonic only (no chi_qr)]")
+_pretty_print(assign_chi, "[Labeling using Kerr + harmonic + effective chi_qr]")
 
 def energy_of_label(assignments, nq, nr):
     for a in assignments:

@@ -1,5 +1,5 @@
 import numpy as np
-from diag import L_c, L_r, C_r, evals_rel, f_res_bare
+from diag import evals_rel, f_res_bare
 
 def _peak_spacing_from_pairwise_diffs(energies, min_diff=1.0, bin_width=0.05):
     energies = np.array(sorted(energies))
@@ -25,22 +25,13 @@ def _nearest_int_multiple_residual(E, omega):
     return abs(E - m * omega), m
 
 
-def _identify_omega_r_from_hint(E, omega_r_hint):
-    """Find the energy level closest to omega_r_hint; that level is |0,1>, so omega_r = E[that]."""
-    E = np.asarray(E)
-    k = int(np.argmin(np.abs(E - omega_r_hint)))
-    return float(E[k]), k
-
-
-def fit_effective_params_2mode(evals_rel, tol_nonmultiple=0.20, omega_r_known=None, omega_r_hint=None):
+def fit_effective_params_2mode(evals_rel, tol_nonmultiple=0.20, omega_r_known=None):
     E = np.array(sorted(evals_rel))
     if E[0] != 0.0:
         E = E - E[0]
 
     if omega_r_known is not None:
         omega_r = float(omega_r_known)
-    elif omega_r_hint is not None:
-        omega_r, _ = _identify_omega_r_from_hint(E, float(omega_r_hint))
     else:
         omega_r = _peak_spacing_from_pairwise_diffs(E[:min(len(E), 16)], min_diff=1.0, bin_width=0.02)
 
@@ -119,14 +110,15 @@ def assign_labels_2mode(evals_rel, p, nq_max=6, nr_max=10, include_chi=True):
     return out
 
 
-OMEGA_R_HINT = 5.81
+OMEGA_R_KNOWN = 6.2
+_omega_r = OMEGA_R_KNOWN if OMEGA_R_KNOWN is not None else f_res_bare
 
-params = fit_effective_params_2mode(evals_rel, omega_r_hint=OMEGA_R_HINT)
+params = fit_effective_params_2mode(evals_rel, omega_r_known=_omega_r)
 assign_nochi = assign_labels_2mode(evals_rel, params, include_chi=False)
 assign_chi   = assign_labels_2mode(evals_rel, params, include_chi=True)
 
 print("\n[Fitted effective 2-mode parameters] (GHz)")
-_r_src = f" (identified from spectrum, hint ~{OMEGA_R_HINT})" if OMEGA_R_HINT is not None else " (from pairwise-diff histogram)"
+_r_src = " (fixed)" if OMEGA_R_KNOWN is not None else " (from circuit bare f_r)"
 print(f"omega_r = {params['omega_r']:.6f}" + _r_src)
 print(f"omega_q ≈ {params['omega_q']:.6f}")
 print(f"alpha_q ≈ {params['alpha_q']:.6f}")
@@ -134,7 +126,7 @@ print(f"chi_qr ≈ {params['chi_qr']:.6f} (effective dispersive/hybridization sh
 
 def _pretty_print(assignments, title):
     print(f"\n{title}")
-    print("  idx    E_obs(GHz)   label    E_pred(GHz)     |Δ|(MHz)")
+    print("  idx    E_obs(GHz)      label      E_pred(GHz)     |Δ|(MHz)")
     for a in assignments:
         print(f"  |{a['k']:2d}>  {a['E']:11.6f}   |{a['nq']},{a['nr']}>   {a['E_pred']:11.6f}    {1e3*a['resid']:8.2f}")
 

@@ -89,13 +89,9 @@ f12 = evals_rel[2] - evals_rel[1]
 anharmonicity = f12 - f01
 
 omega_r = 1.0 / np.sqrt(L_r * C_r)
-f_res_bare = omega_r / (2 * np.pi) / 1e9 
+f_res_bare = omega_r / (2 * np.pi) / 1e9    # GHz
 
 detuning = f01 - f_res_bare
-
-
-f_r = 1/(2 * np.pi * np.sqrt(L_r + L_c) * C_r)
-print(f_r)
 
 print("\nTransitions & nonlinearities (GHz):")
 print(f"f01 (ground→1) = {f01:.6f}")

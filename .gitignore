@@ -52,3 +52,4 @@ htmlcov/
 
 archive/
 .claude/
+plot_output/

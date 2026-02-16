@@ -1,4 +1,3 @@
-import os
 import sys
 import numpy as np
 import matplotlib.pyplot as plt
@@ -272,6 +271,5 @@ ax.legend(frameon=False, ncols=2, fontsize=9, loc="upper right")
 ax.grid(True, alpha=0.25)
 fig.tight_layout()
 
-os.makedirs("plot_output", exist_ok=True)
-plt.savefig("plot_output/energy_levels_vs_flux.png", dpi=150)
+plt.savefig("energy_levels_vs_flux.pdf", dpi=150)
 plt.show()

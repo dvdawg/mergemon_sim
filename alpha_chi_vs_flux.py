@@ -1,4 +1,3 @@
-import os
 import sys
 import numpy as np
 import matplotlib.pyplot as plt
@@ -350,7 +349,6 @@ ax2.axhline(0, color="gray", linewidth=0.5, linestyle="--")
 ax2.grid(True, alpha=0.25)
 
 fig.tight_layout()
-os.makedirs("plot_output", exist_ok=True)
-plt.savefig("plot_output/alpha_chi_vs_flux.png", dpi=150)
-print("\nSaved: plot_output/alpha_chi_vs_flux.png")
+plt.savefig("alpha_chi_vs_flux.pdf", dpi=150)
+print("\nSaved: alpha_chi_vs_flux.pdf")
 plt.show()

@@ -2,13 +2,13 @@ import numpy as np
 import scqubits as scq
 
 # params given
-L_r  = 0.60e-9 
-C_r  = 1.00e-12 
-L_c  = 0.15e-9  
-L_J1 = 18.3e-9  
-L_J2 = 11.0e-9  
-C_J1 = 55e-15
-C_J2 = 33e-15   
+L_r  = 0.50e-9
+C_r  = 0.80e-12
+L_c  = 0.16e-9
+L_J1 = 30.0e-9
+L_J2 = 30.0e-9
+C_J1 = 40e-15
+C_J2 = 40e-15
 
 # constants
 PHI0 = 2.067833848e-15 
@@ -18,14 +18,14 @@ H = 6.62607015e-34
 # conversions
 def inductive_energy_ghz(L_H: float) -> float:
     """Return inductive energy EL / h in GHz for an inductor L (in Henries)."""
-    EJ_J = (PHI0 / (2 * np.pi)) ** 2 / L_H  # Joules
-    return EJ_J / (H * 1e9)                 # GHz
+    EJ_J = (PHI0 / (2 * np.pi)) ** 2 / L_H # Joules
+    return EJ_J / (H * 1e9) # GHz
 
 
 def charging_energy_ghz(C_F: float) -> float:
     """Return charging energy EC / h in GHz for a capacitor C (in Farads)."""
-    EC_J = E_CHARGE ** 2 / (2 * C_F)  # Joules
-    return EC_J / (H * 1e9)           # GHz
+    EC_J = E_CHARGE ** 2 / (2 * C_F) # Joules
+    return EC_J / (H * 1e9) # GHz
 
 
 E_J1  = inductive_energy_ghz(L_J1)
@@ -61,6 +61,10 @@ def build_circuit(yaml_str: str):
 
 
 circ = build_circuit(iMET_yaml)
+# Truncation: match energy_levels_vs_flux.py for flux sweeps
+circ.cutoff_n_1 = 6
+circ.cutoff_ext_2 = 10
+circ.cutoff_ext_3 = 10
 
 try:
     circ.print_circuit()
@@ -74,6 +78,31 @@ except Exception:
 
 print("\Cutoff template:")
 print(cutoff_template)
+
+# External flux: use first flux variable if present (for get_spectrum)
+_flux_syms = getattr(circ, "external_fluxes", None)
+if _flux_syms is not None and len(_flux_syms) > 0:
+    _flux_attr = str(_flux_syms[0])
+    setattr(circ, _flux_attr, 0.0)
+else:
+    _flux_attr = None
+
+
+def get_spectrum(phi_ext, evals_count=40):
+    """Return (evals, evecs) in GHz for the circuit at external flux phi_ext (in units of Phi_0).
+    evals: 1d array; evecs: (dim, evals_count) with columns = eigenstates.
+    """
+    if _flux_attr is not None:
+        setattr(circ, _flux_attr, float(phi_ext))
+    evals, evecs = circ.eigensys(evals_count=evals_count)
+    evals = np.asarray(evals)
+    evecs = np.asarray(evecs)
+    if evecs.ndim == 1:
+        evecs = evecs[:, np.newaxis]
+    if evecs.shape[0] < evecs.shape[1]:
+        evecs = evecs.T
+    return evals, evecs
+
 
 evals_count = 12
 evals, evecs = circ.eigensys(evals_count=evals_count)

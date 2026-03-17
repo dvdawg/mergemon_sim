@@ -1,5 +1,4 @@
 import numpy as np
-from diag import L_c, L_r, C_r, evals_rel, f_res_bare
 
 def _peak_spacing_from_pairwise_diffs(energies, min_diff=1.0, bin_width=0.05):
     energies = np.array(sorted(energies))
@@ -119,40 +118,44 @@ def assign_labels_2mode(evals_rel, p, nq_max=6, nr_max=10, include_chi=True):
     return out
 
 
-OMEGA_R_HINT = 5.81
-
-params = fit_effective_params_2mode(evals_rel, omega_r_hint=OMEGA_R_HINT)
-assign_nochi = assign_labels_2mode(evals_rel, params, include_chi=False)
-assign_chi   = assign_labels_2mode(evals_rel, params, include_chi=True)
-
-print("\n[Fitted effective 2-mode parameters] (GHz)")
-_r_src = f" (identified from spectrum, hint ~{OMEGA_R_HINT})" if OMEGA_R_HINT is not None else " (from pairwise-diff histogram)"
-print(f"omega_r = {params['omega_r']:.6f}" + _r_src)
-print(f"omega_q ≈ {params['omega_q']:.6f}")
-print(f"alpha_q ≈ {params['alpha_q']:.6f}")
-print(f"chi_qr ≈ {params['chi_qr']:.6f} (effective dispersive/hybridization shift)")
-
-def _pretty_print(assignments, title):
-    print(f"\n{title}")
-    print("  idx    E_obs(GHz)   label    E_pred(GHz)     |Δ|(MHz)")
-    for a in assignments:
-        print(f"  |{a['k']:2d}>  {a['E']:11.6f}   |{a['nq']},{a['nr']}>   {a['E_pred']:11.6f}    {1e3*a['resid']:8.2f}")
-
-_pretty_print(assign_nochi,"[Labeling using Kerr + harmonic only (no chi_qr)]")
-_pretty_print(assign_chi, "[Labeling using Kerr + harmonic + effective chi_qr]")
-
 def energy_of_label(assignments, nq, nr):
     for a in assignments:
         if a["nq"] == nq and a["nr"] == nr:
             return a["E"]
     return None
 
-E00 = energy_of_label(assign_chi, 0, 0)
-Eq10 = energy_of_label(assign_chi, 1, 0)
-Er01 = energy_of_label(assign_chi, 0, 1)
 
-print("\n[Fundamentals inferred from labels] (GHz)")
-if Eq10 is not None:
-    print(f"  f_q01 ≈ E|1,0> - E|0,0> = {Eq10 - E00:.6f}")
-if Er01 is not None:
-    print(f"  f_r01 ≈ E|0,1> - E|0,0> = {Er01 - E00:.6f}")
+if __name__ == "__main__":
+    from diag import L_c, L_r, C_r, evals_rel, f_res_bare
+
+    OMEGA_R_HINT = 5.81
+
+    params = fit_effective_params_2mode(evals_rel, omega_r_hint=OMEGA_R_HINT)
+    assign_nochi = assign_labels_2mode(evals_rel, params, include_chi=False)
+    assign_chi   = assign_labels_2mode(evals_rel, params, include_chi=True)
+
+    print("\n[Fitted effective 2-mode parameters] (GHz)")
+    _r_src = f" (identified from spectrum, hint ~{OMEGA_R_HINT})" if OMEGA_R_HINT is not None else " (from pairwise-diff histogram)"
+    print(f"omega_r = {params['omega_r']:.6f}" + _r_src)
+    print(f"omega_q ≈ {params['omega_q']:.6f}")
+    print(f"alpha_q ≈ {params['alpha_q']:.6f}")
+    print(f"chi_qr ≈ {params['chi_qr']:.6f} (effective dispersive/hybridization shift)")
+
+    def _pretty_print(assignments, title):
+        print(f"\n{title}")
+        print("  idx    E_obs(GHz)   label    E_pred(GHz)     |Δ|(MHz)")
+        for a in assignments:
+            print(f"  |{a['k']:2d}>  {a['E']:11.6f}   |{a['nq']},{a['nr']}>   {a['E_pred']:11.6f}    {1e3*a['resid']:8.2f}")
+
+    _pretty_print(assign_nochi, "[Labeling using Kerr + harmonic only (no chi_qr)]")
+    _pretty_print(assign_chi,   "[Labeling using Kerr + harmonic + effective chi_qr]")
+
+    E00  = energy_of_label(assign_chi, 0, 0)
+    Eq10 = energy_of_label(assign_chi, 1, 0)
+    Er01 = energy_of_label(assign_chi, 0, 1)
+
+    print("\n[Fundamentals inferred from labels] (GHz)")
+    if Eq10 is not None:
+        print(f"  f_q01 ≈ E|1,0> - E|0,0> = {Eq10 - E00:.6f}")
+    if Er01 is not None:
+        print(f"  f_r01 ≈ E|0,1> - E|0,0> = {Er01 - E00:.6f}")

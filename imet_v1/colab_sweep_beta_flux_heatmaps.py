@@ -1,3 +1,10 @@
+"""
+Standalone iMET beta/flux heatmap sweep script.
+
+Colab setup (run once in a notebook cell before executing this script):
+    !pip install -q scqubits scipy matplotlib numpy
+"""
+
 import numpy as np
 import matplotlib.pyplot as plt
 import scqubits as scq
@@ -7,16 +14,142 @@ import csv
 import time
 from scipy.optimize import linear_sum_assignment
 
+
 class HiddenPrints:
     def __enter__(self):
         self._original_stdout = sys.stdout
-        sys.stdout = open(os.devnull, 'w')
+        sys.stdout = open(os.devnull, "w")
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         sys.stdout.close()
         sys.stdout = self._original_stdout
 
-with HiddenPrints():
-    from identification import fit_effective_params_2mode, assign_labels_2mode
+
+def _peak_spacing_from_pairwise_diffs(energies, min_diff=1.0, bin_width=0.05):
+    energies = np.array(sorted(energies))
+    diffs = []
+    for i in range(len(energies)):
+        for j in range(i + 1, len(energies)):
+            d = energies[j] - energies[i]
+            if d >= min_diff:
+                diffs.append(float(d))
+    diffs = np.array(diffs)
+    if diffs.size == 0:
+        raise ValueError("Not enough diffs to estimate a spacing.")
+
+    dmin, dmax = diffs.min(), diffs.max()
+    nbins = max(10, int(np.ceil((dmax - dmin) / bin_width)))
+    hist, edges = np.histogram(diffs, bins=nbins, range=(dmin, dmax))
+    k = int(np.argmax(hist))
+    return 0.5 * (edges[k] + edges[k + 1])
+
+
+def _nearest_int_multiple_residual(E, omega):
+    m = int(np.round(E / omega))
+    return abs(E - m * omega), m
+
+
+def _identify_omega_r_from_hint(E, omega_r_hint):
+    E = np.asarray(E)
+    k = int(np.argmin(np.abs(E - omega_r_hint)))
+    return float(E[k]), k
+
+
+def fit_effective_params_2mode(
+    evals_rel, tol_nonmultiple=0.20, omega_r_known=None, omega_r_hint=None
+):
+    E = np.array(sorted(evals_rel))
+    if E[0] != 0.0:
+        E = E - E[0]
+
+    if omega_r_known is not None:
+        omega_r = float(omega_r_known)
+    elif omega_r_hint is not None:
+        omega_r, _ = _identify_omega_r_from_hint(E, float(omega_r_hint))
+    else:
+        omega_r = _peak_spacing_from_pairwise_diffs(
+            E[: min(len(E), 16)], min_diff=1.0, bin_width=0.02
+        )
+
+    omega_q = None
+    for Ek in E[1:]:
+        resid, _ = _nearest_int_multiple_residual(Ek, omega_r)
+        if resid > tol_nonmultiple:
+            omega_q = float(Ek)
+            break
+    if omega_q is None:
+        omega_q = float(E[2]) if len(E) > 2 else float(E[1])
+
+    target_2q = 2.0 * omega_q
+    idx_2q = int(np.argmin(np.abs(E - target_2q)))
+    alpha_q = float(E[idx_2q] - target_2q)
+
+    target_11 = omega_q + omega_r
+    idx_11 = int(np.argmin(np.abs(E - target_11)))
+    chi_qr = float(E[idx_11] - target_11)
+
+    return dict(omega_r=omega_r, omega_q=omega_q, alpha_q=alpha_q, chi_qr=chi_qr)
+
+
+def predicted_energy_2mode(nq, nr, p, include_chi=True):
+    omega_q, omega_r = p["omega_q"], p["omega_r"]
+    alpha_q = p["alpha_q"]
+    chi_qr = p["chi_qr"] if include_chi else 0.0
+    return (
+        omega_q * nq
+        + 0.5 * alpha_q * nq * (nq - 1)
+        + omega_r * nr
+        + chi_qr * nq * nr
+    )
+
+
+def assign_labels_2mode(evals_rel, p, nq_max=6, nr_max=10, include_chi=True):
+    E = np.array(sorted(evals_rel))
+    E = E - E[0]
+
+    cand = []
+    for nq in range(nq_max + 1):
+        for nr in range(nr_max + 1):
+            Ep = predicted_energy_2mode(nq, nr, p, include_chi=include_chi)
+            cand.append((Ep, nq, nr))
+    cand.sort(key=lambda t: t[0])
+
+    used = set()
+    out = []
+    for k, Ek in enumerate(E):
+        best = None
+        best_score = 1e99
+
+        for Ep, nq, nr in cand:
+            if (nq, nr) in used:
+                continue
+            if abs(Ep - Ek) > 1.0:
+                continue
+
+            resid = abs(Ep - Ek)
+            penalty = 1e-3 * (nq + nr)
+            score = resid + penalty
+            if score < best_score:
+                best_score = score
+                best = (nq, nr, Ep, resid)
+
+        if best is None:
+            for Ep, nq, nr in cand:
+                if (nq, nr) in used:
+                    continue
+                resid = abs(Ep - Ek)
+                penalty = 1e-3 * (nq + nr)
+                score = resid + penalty
+                if score < best_score:
+                    best_score = score
+                    best = (nq, nr, Ep, resid)
+
+        nq, nr, Ep, resid = best
+        used.add((nq, nr))
+        out.append(dict(k=k, E=Ek, nq=nq, nr=nr, E_pred=Ep, resid=resid))
+
+    return out
+
 
 L_r_orig = 0.50e-9
 C_r = 0.80e-12
@@ -40,7 +173,7 @@ def inductive_energy_ghz(L_H: float) -> float:
 
 
 def charging_energy_ghz(C_F: float) -> float:
-    EC_J = E_CHARGE ** 2 / (2 * C_F)
+    EC_J = E_CHARGE**2 / (2 * C_F)
     return EC_J / (H * 1e9)
 
 
@@ -130,7 +263,6 @@ def sweep_beta_column(
 
     n_flux = len(phi_vals)
     raw_evals = np.full((n_flux, evals_count), np.nan)
-    all_evecs = []
     beta = L_c / L_tot
     prefix = (
         f"[beta {beta_index}/{beta_total} | beta={beta:.6f}]"
@@ -156,7 +288,6 @@ def sweep_beta_column(
                 evecs = evecs[:, np.newaxis]
             if evecs.shape[0] < evecs.shape[1]:
                 evecs = evecs.T
-
             if idx == 0:
                 tracked_evals = np.zeros_like(raw_evals)
                 tracked_evals[0] = raw_evals[0]
@@ -210,7 +341,7 @@ def sweep_beta_column(
 def format_label(label):
     if label is None:
         return "unlabeled"
-    return f"|{label[0]},{label[1]}⟩"
+    return f"|{label[0]},{label[1]}>"
 
 
 def write_sweep_csv(path, L_c_vals, phi_vals, alpha_grid, chi_grid):
@@ -286,7 +417,9 @@ def write_crossings_csv(path, crossing_records):
             )
 
 
-def detect_tracked_crossings(beta: float, phi_vals: np.ndarray, tracked_evals: np.ndarray, tracked_labels):
+def detect_tracked_crossings(
+    beta: float, phi_vals: np.ndarray, tracked_evals: np.ndarray, tracked_labels
+):
     n_flux, n_levels = tracked_evals.shape
     if n_flux < 3:
         return []
@@ -333,14 +466,18 @@ def detect_tracked_crossings(beta: float, phi_vals: np.ndarray, tracked_evals: n
                     if denom == 0.0:
                         phi_cross = 0.5 * (phi_vals[idx] + phi_vals[idx + 1])
                     else:
-                        phi_cross = phi_vals[idx] - diff[idx] * (phi_vals[idx + 1] - phi_vals[idx]) / denom
+                        phi_cross = phi_vals[idx] - diff[idx] * (
+                            phi_vals[idx + 1] - phi_vals[idx]
+                        ) / denom
 
-                if abs(rank[idx, level_a] - rank[idx, level_b]) == 1 or abs(rank[idx + 1, level_a] - rank[idx + 1, level_b]) == 1:
+                if abs(rank[idx, level_a] - rank[idx, level_b]) == 1 or abs(
+                    rank[idx + 1, level_a] - rank[idx + 1, level_b]
+                ) == 1:
                     flux_idx = idx if gap[idx] <= gap[idx + 1] else idx + 1
                     add_record("crossing", phi_cross, 0.0, level_a, level_b, flux_idx)
 
             for idx in range(1, n_flux - 1):
-                if not np.isfinite(gap[idx - 1:idx + 2]).all():
+                if not np.isfinite(gap[idx - 1 : idx + 2]).all():
                     continue
                 if abs(rank[idx, level_a] - rank[idx, level_b]) != 1:
                     continue
@@ -361,10 +498,7 @@ def detect_tracked_crossings(beta: float, phi_vals: np.ndarray, tracked_evals: n
     for rec in records:
         duplicate = False
         for prev in deduped:
-            same_pair = (
-                rec["level_a"] == prev["level_a"]
-                and rec["level_b"] == prev["level_b"]
-            )
+            same_pair = rec["level_a"] == prev["level_a"] and rec["level_b"] == prev["level_b"]
             if same_pair and abs(rec["phi"] - prev["phi"]) <= phi_tol:
                 if rec["gap_ghz"] < prev["gap_ghz"]:
                     prev.update(rec)
@@ -377,9 +511,9 @@ def detect_tracked_crossings(beta: float, phi_vals: np.ndarray, tracked_evals: n
 
 
 def main():
-    n_L = 21
-    n_flux = 21
-    evals_count = 16
+    n_L = 201
+    n_flux = 201
+    evals_count = 10
     L_c_vals = np.linspace(0, L_tot, n_L)
     phi_vals = np.linspace(-0.5, 0.5, n_flux)
 
@@ -393,9 +527,9 @@ def main():
     done = 0
     overall_start = time.perf_counter()
     print(
-        f"Computing alpha/chi heatmaps and tracked flux-sweep crossings "
-        f"(< {MAX_OVERLAY_GAP_GHZ * 1e3:.0f} MHz gap) on "
-        f"{n_L} beta columns x {n_flux} flux points…"
+        f"Computing alpha/chi heatmaps and tracked flux-sweep crossings on "
+        f"{n_L} beta columns x {n_flux} flux points "
+        f"(< {MAX_OVERLAY_GAP_GHZ * 1e3:.0f} MHz gap)..."
     )
     for i, L_c in enumerate(L_c_vals):
         beta = L_c / L_tot
@@ -461,20 +595,27 @@ def main():
     fig, (ax_alpha, ax_chi, ax_abs_chi) = plt.subplots(1, 3, figsize=(20, 5))
 
     im_alpha = ax_alpha.pcolormesh(
-        beta_vals, phi_vals, alpha_mhz,
-        shading="auto", cmap="viridis",
-        vmin=alpha_vmin, vmax=alpha_vmax,
+        beta_vals,
+        phi_vals,
+        alpha_mhz,
+        shading="auto",
+        cmap="viridis",
+        vmin=alpha_vmin,
+        vmax=alpha_vmax,
     )
     ax_alpha.set_xlabel(r"$\beta = L_c / L_\mathrm{tot}$")
     ax_alpha.set_ylabel(r"External flux $\Phi_\mathrm{ext}/\Phi_0$")
     ax_alpha.set_title(r"Anharmonicity $\alpha$ (MHz)")
     plt.colorbar(im_alpha, ax=ax_alpha, label=r"$\alpha$ (MHz)")
 
-    # Chi heatmap
     im_chi = ax_chi.pcolormesh(
-        beta_vals, phi_vals, chi_mhz,
-        shading="auto", cmap="plasma",
-        vmin=chi_vmin, vmax=chi_vmax,
+        beta_vals,
+        phi_vals,
+        chi_mhz,
+        shading="auto",
+        cmap="plasma",
+        vmin=chi_vmin,
+        vmax=chi_vmax,
     )
     ax_chi.set_xlabel(r"$\beta = L_c / L_\mathrm{tot}$")
     ax_chi.set_ylabel(r"External flux $\Phi_\mathrm{ext}/\Phi_0$")
@@ -482,9 +623,13 @@ def main():
     plt.colorbar(im_chi, ax=ax_chi, label=r"$\chi$ (MHz)")
 
     im_alpha_only = ax_alpha_only.pcolormesh(
-        beta_vals, phi_vals, alpha_mhz,
-        shading="auto", cmap="viridis",
-        vmin=alpha_vmin, vmax=alpha_vmax,
+        beta_vals,
+        phi_vals,
+        alpha_mhz,
+        shading="auto",
+        cmap="viridis",
+        vmin=alpha_vmin,
+        vmax=alpha_vmax,
     )
     ax_alpha_only.set_xlabel(r"$\beta = L_c / L_\mathrm{tot}$")
     ax_alpha_only.set_ylabel(r"External flux $\Phi_\mathrm{ext}/\Phi_0$")
@@ -492,9 +637,13 @@ def main():
     plt.colorbar(im_alpha_only, ax=ax_alpha_only, label=r"$\alpha$ (MHz)")
 
     im_chi_only = ax_chi_only.pcolormesh(
-        beta_vals, phi_vals, chi_mhz,
-        shading="auto", cmap="plasma",
-        vmin=chi_vmin, vmax=chi_vmax,
+        beta_vals,
+        phi_vals,
+        chi_mhz,
+        shading="auto",
+        cmap="plasma",
+        vmin=chi_vmin,
+        vmax=chi_vmax,
     )
     ax_chi_only.set_xlabel(r"$\beta = L_c / L_\mathrm{tot}$")
     ax_chi_only.set_ylabel(r"External flux $\Phi_\mathrm{ext}/\Phi_0$")
@@ -502,9 +651,13 @@ def main():
     plt.colorbar(im_chi_only, ax=ax_chi_only, label=r"$\chi$ (MHz)")
 
     im_abs_chi = ax_abs_chi.pcolormesh(
-        beta_vals, phi_vals, abs_chi_mhz,
-        shading="auto", cmap="magma",
-        vmin=0.0, vmax=float(np.nanmax(abs_chi_mhz)) if not np.all(np.isnan(abs_chi_mhz)) else 1.0,
+        beta_vals,
+        phi_vals,
+        abs_chi_mhz,
+        shading="auto",
+        cmap="magma",
+        vmin=0.0,
+        vmax=float(np.nanmax(abs_chi_mhz)) if not np.all(np.isnan(abs_chi_mhz)) else 1.0,
     )
     ax_abs_chi.set_xlabel(r"$\beta = L_c / L_\mathrm{tot}$")
     ax_abs_chi.set_ylabel(r"External flux $\Phi_\mathrm{ext}/\Phi_0$")
@@ -512,9 +665,13 @@ def main():
     plt.colorbar(im_abs_chi, ax=ax_abs_chi, label=r"$|\chi|$ (MHz)")
 
     im_abs_chi_only = ax_abs_chi_only.pcolormesh(
-        beta_vals, phi_vals, abs_chi_mhz,
-        shading="auto", cmap="magma",
-        vmin=0.0, vmax=float(np.nanmax(abs_chi_mhz)) if not np.all(np.isnan(abs_chi_mhz)) else 1.0,
+        beta_vals,
+        phi_vals,
+        abs_chi_mhz,
+        shading="auto",
+        cmap="magma",
+        vmin=0.0,
+        vmax=float(np.nanmax(abs_chi_mhz)) if not np.all(np.isnan(abs_chi_mhz)) else 1.0,
     )
     ax_abs_chi_only.set_xlabel(r"$\beta = L_c / L_\mathrm{tot}$")
     ax_abs_chi_only.set_ylabel(r"External flux $\Phi_\mathrm{ext}/\Phi_0$")
@@ -571,7 +728,7 @@ def main():
                 linewidths=0.8,
                 zorder=6,
             )
-            ax_abs_chi.scatter(
+            ax_chi.scatter(
                 beta_cross[avoided_mask],
                 phi_cross[avoided_mask],
                 s=24,
@@ -580,7 +737,7 @@ def main():
                 linewidths=0.8,
                 zorder=6,
             )
-            ax_chi.scatter(
+            ax_abs_chi.scatter(
                 beta_cross[avoided_mask],
                 phi_cross[avoided_mask],
                 s=24,
@@ -632,7 +789,6 @@ def main():
     print(f"Saved {heatmaps_only_path}")
     print(f"Saved {out_path}")
     plt.show()
-
 
 if __name__ == "__main__":
     main()

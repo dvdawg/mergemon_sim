@@ -43,6 +43,47 @@ NA_MAX = 3
 NR_MAX = 6
 
 
+def _peak_spacing_from_pairwise_diffs(energies, min_diff=1.0, bin_width=0.05):
+    energies = np.array(sorted(energies))
+    diffs = []
+    for i in range(len(energies)):
+        for j in range(i + 1, len(energies)):
+            d = energies[j] - energies[i]
+            if d >= min_diff:
+                diffs.append(float(d))
+    diffs = np.array(diffs)
+    if diffs.size == 0:
+        raise ValueError("Not enough diffs to estimate a spacing.")
+    dmin, dmax = diffs.min(), diffs.max()
+    nbins = max(10, int(np.ceil((dmax - dmin) / bin_width)))
+    hist, edges = np.histogram(diffs, bins=nbins, range=(dmin, dmax))
+    k = int(np.argmax(hist))
+    return 0.5 * (edges[k] + edges[k + 1])
+
+
+def _nearest_int_multiple_residual(E, omega):
+    m = int(np.round(E / omega))
+    return abs(E - m * omega), m
+
+
+def _identify_omega_from_hint(E, omega_hint):
+    E = np.asarray(E)
+    k = int(np.argmin(np.abs(E - omega_hint)))
+    return float(E[k]), k
+
+
+def _match_nearest_unused_level(E, target, used_indices=None):
+    E = np.asarray(E)
+    if used_indices is None:
+        used_indices = set()
+    order = np.argsort(np.abs(E - target))
+    for idx in order:
+        idx = int(idx)
+        if idx not in used_indices:
+            return idx
+    raise ValueError("No unused energy levels available for matching.")
+
+
 def E_J_squid(phi_ext):
     phi_ext = np.asarray(phi_ext, dtype=float)
     arg     = np.pi * phi_ext
@@ -72,8 +113,8 @@ def predict_3mode(phi_ext, analytical_params):
     """
     Predicted energies for states |nq, na, nr> using the 3-mode Hamiltonian:
 
-    H = omega_q*nq + alpha_q/2*nq*(nq-1)
-      + omega_a*na + alpha_a/2*na*(na-1)
+    H = omega_q*nq - alpha_q/2*nq*(nq-1)
+      + omega_a*na - alpha_a/2*na*(na-1)
       + omega_r*nr
       + chi_qa*nq*na + chi_ar*na*nr + chi_qr*nq*nr
 
@@ -93,7 +134,7 @@ def predict_3mode(phi_ext, analytical_params):
     preds = {}
     for nq in range(NQ_MAX + 1):
         for na in range(NA_MAX + 1):
-            Ea = omega_a * na + 0.5 * alpha_a * na * (na - 1)
+            Ea = omega_a * na - 0.5 * alpha_a * na * (na - 1)
             for nr in range(NR_MAX + 1):
                 E = (
                     eq[nq] + Ea + nr * OMEGA_R_GHZ
@@ -105,24 +146,263 @@ def predict_3mode(phi_ext, analytical_params):
     return preds
 
 
-def assign_labels(evals_rel, phi_ext, analytical_params):
-    preds   = predict_3mode(phi_ext, analytical_params)
-    cands   = sorted(preds.items(), key=lambda kv: kv[1])
-    N       = len(evals_rel)
-    n_cands = min(len(cands), N)
+def fit_effective_params_3mode(
+    evals_rel,
+    tol_nonmultiple=0.20,
+    omega_r_known=None,
+    omega_r_hint=None,
+    omega_q_hint=None,
+    omega_a_hint=None,
+):
+    E = np.array(sorted(evals_rel))
+    if E[0] != 0.0:
+        E = E - E[0]
+    E_max = float(E[-1])
 
-    cost = np.full((N, n_cands), 1e9)
-    for i, E_meas in enumerate(evals_rel):
-        for j, ((nq, na, nr), E_pred) in enumerate(cands[:n_cands]):
-            cost[i, j] = abs(E_meas - E_pred)
+    if omega_r_known is not None:
+        omega_r = float(omega_r_known)
+    elif omega_r_hint is not None:
+        omega_r, _ = _identify_omega_from_hint(E, float(omega_r_hint))
+    else:
+        omega_r = _peak_spacing_from_pairwise_diffs(
+            E[: min(len(E), 20)], min_diff=1.0, bin_width=0.02
+        )
+
+    if omega_q_hint is not None:
+        omega_q, _ = _identify_omega_from_hint(E, float(omega_q_hint))
+    else:
+        omega_q = None
+        for Ek in E[1:]:
+            resid, _ = _nearest_int_multiple_residual(Ek, omega_r)
+            if resid > tol_nonmultiple:
+                omega_q = float(Ek)
+                break
+        if omega_q is None:
+            omega_q = float(E[1])
+
+    ancilla_above_spectrum = False
+    if omega_a_hint is not None:
+        if float(omega_a_hint) > E_max:
+            omega_a = float(omega_a_hint)
+            ancilla_above_spectrum = True
+        else:
+            omega_a, _ = _identify_omega_from_hint(E, float(omega_a_hint))
+    else:
+        omega_a = None
+        for Ek in E[1:]:
+            resid, _ = _nearest_int_multiple_residual(Ek, omega_r)
+            if resid > tol_nonmultiple and abs(Ek - omega_q) > tol_nonmultiple:
+                omega_a = float(Ek)
+                break
+        if omega_a is None:
+            omega_a = float(E[3]) if len(E) > 3 else float(E[2])
+
+    target_2q = 2.0 * omega_q
+    idx_2q = int(np.argmin(np.abs(E - target_2q)))
+    alpha_q = float(target_2q - E[idx_2q])
+
+    if ancilla_above_spectrum:
+        alpha_a = 0.0
+        chi_qa = 0.0
+        chi_ar = 0.0
+    else:
+        target_2a = 2.0 * omega_a
+        idx_2a = int(np.argmin(np.abs(E - target_2a)))
+        alpha_a = float(target_2a - E[idx_2a])
+
+        target_qa = omega_q + omega_a
+        idx_qa = int(np.argmin(np.abs(E - target_qa)))
+        chi_qa = float(E[idx_qa] - target_qa)
+
+        target_ar = omega_a + omega_r
+        idx_ar = int(np.argmin(np.abs(E - target_ar)))
+        chi_ar = float(E[idx_ar] - target_ar)
+
+    target_qr = omega_q + omega_r
+    idx_qr = int(np.argmin(np.abs(E - target_qr)))
+    chi_qr = float(E[idx_qr] - target_qr)
+
+    return dict(
+        omega_r=omega_r,
+        omega_q=omega_q,
+        omega_a=omega_a,
+        alpha_q=alpha_q,
+        alpha_a=alpha_a,
+        chi_qa=chi_qa,
+        chi_ar=chi_ar,
+        chi_qr=chi_qr,
+        _ancilla_above_spectrum=ancilla_above_spectrum,
+    )
+
+
+def predicted_energy_from_fit(nq, na, nr, p, include_chi=True):
+    chi_qa = p["chi_qa"] if include_chi else 0.0
+    chi_ar = p["chi_ar"] if include_chi else 0.0
+    chi_qr = p["chi_qr"] if include_chi else 0.0
+    return (
+        p["omega_q"] * nq
+        - 0.5 * p["alpha_q"] * nq * (nq - 1)
+        + p["omega_a"] * na
+        - 0.5 * p["alpha_a"] * na * (na - 1)
+        + p["omega_r"] * nr
+        + chi_qa * nq * na
+        + chi_ar * na * nr
+        + chi_qr * nq * nr
+    )
+
+
+def assign_labels_3mode(evals_rel, p, nq_max=NQ_MAX, na_max=NA_MAX, nr_max=NR_MAX, include_chi=True):
+    E = np.array(sorted(evals_rel))
+    E = E - E[0]
+
+    cand = []
+    for nq in range(nq_max + 1):
+        for na in range(na_max + 1):
+            for nr in range(nr_max + 1):
+                Ep = predicted_energy_from_fit(nq, na, nr, p, include_chi=include_chi)
+                cand.append((Ep, nq, na, nr))
+    cand.sort(key=lambda t: t[0])
+
+    e_max = float(E[-1])
+    anchor_specs = [(0.0, 0, 0, 0)]
+    for nq in range(1, nq_max + 1):
+        target = nq * p["omega_q"]
+        if target <= e_max + 1.0:
+            anchor_specs.append((target, nq, 0, 0))
+    for na in range(1, na_max + 1):
+        target = na * p["omega_a"]
+        if target <= e_max + 1.0:
+            anchor_specs.append((target, 0, na, 0))
+    for nr in range(1, nr_max + 1):
+        target = nr * p["omega_r"]
+        if target <= e_max + 1.0:
+            anchor_specs.append((target, 0, 0, nr))
+    anchor_specs.sort(key=lambda t: t[0])
+
+    used = set()
+    used_energy_indices = set()
+    anchored_by_index = {}
+    for target, nq, na, nr in anchor_specs:
+        idx = _match_nearest_unused_level(E, target, used_energy_indices)
+        anchored_by_index[idx] = dict(
+            k=idx,
+            E=E[idx],
+            nq=nq,
+            na=na,
+            nr=nr,
+            E_pred=predicted_energy_from_fit(nq, na, nr, p, include_chi=include_chi),
+            resid=abs(E[idx] - target),
+        )
+        used.add((nq, na, nr))
+        used_energy_indices.add(idx)
+
+    out = []
+    for k, Ek in enumerate(E):
+        if k in anchored_by_index:
+            out.append(anchored_by_index[k])
+            continue
+
+        best = None
+        best_score = 1e99
+        for Ep, nq, na, nr in cand:
+            if (nq, na, nr) in used:
+                continue
+            if abs(Ep - Ek) > 1.0:
+                continue
+            resid = abs(Ep - Ek)
+            penalty = 1e-3 * (nq + na + nr)
+            score = resid + penalty
+            if score < best_score:
+                best_score = score
+                best = (nq, na, nr, Ep, resid)
+
+        if best is None:
+            for Ep, nq, na, nr in cand:
+                if (nq, na, nr) in used:
+                    continue
+                resid = abs(Ep - Ek)
+                penalty = 1e-3 * (nq + na + nr)
+                score = resid + penalty
+                if score < best_score:
+                    best_score = score
+                    best = (nq, na, nr, Ep, resid)
+
+        nq, na, nr, Ep, resid = best
+        used.add((nq, na, nr))
+        out.append(dict(k=k, E=Ek, nq=nq, na=na, nr=nr, E_pred=Ep, resid=resid))
+
+    return out
+
+
+def _match_branches_step(
+    prev_evals,
+    curr_evals,
+    prev_evecs,
+    curr_evecs,
+    delta_phi,
+    prev_prev_evals=None,
+    overlap_weight=4.0,
+    energy_weight=0.7,
+    slope_weight=1.6,
+    energy_scale=0.05,
+    slope_scale=0.02,
+):
+    overlap = np.abs(curr_evecs.conj().T @ prev_evecs) ** 2
+    n_curr, n_prev = overlap.shape
+    cost = overlap_weight * (1.0 - overlap)
+
+    energy_cost = np.abs(curr_evals[:, None] - prev_evals[None, :]) / energy_scale
+    cost += energy_weight * energy_cost
+
+    if prev_prev_evals is not None:
+        prev_slope = (prev_evals - prev_prev_evals) / delta_phi
+        predicted = prev_evals + prev_slope * delta_phi
+        slope_cost = np.abs(curr_evals[:, None] - predicted[None, :]) / slope_scale
+        cost += slope_weight * slope_cost
 
     row_ind, col_ind = linear_sum_assignment(cost)
+    perm = np.empty_like(col_ind)
+    perm[col_ind] = row_ind
+    return perm
 
-    labels = {}
-    for r, c in zip(row_ind, col_ind):
-        (nq, na, nr), E_pred = cands[c]
-        labels[r] = (nq, na, nr, E_pred)
-    return labels
+
+def track_eigenbranches(raw_evals, all_evecs, phi_vals, start_idx):
+    n_flux, n_levels = raw_evals.shape
+    tracked_evals = np.zeros_like(raw_evals)
+    tracked_evecs = [None] * n_flux
+
+    tracked_evals[start_idx] = raw_evals[start_idx]
+    tracked_evecs[start_idx] = all_evecs[start_idx]
+
+    for i in range(start_idx + 1, n_flux):
+        prev_prev_evals = tracked_evals[i - 2] if i - 2 >= start_idx else None
+        delta_phi = float(phi_vals[i] - phi_vals[i - 1])
+        perm = _match_branches_step(
+            tracked_evals[i - 1],
+            raw_evals[i],
+            tracked_evecs[i - 1],
+            all_evecs[i],
+            delta_phi,
+            prev_prev_evals=prev_prev_evals,
+        )
+        tracked_evals[i] = raw_evals[i][perm]
+        tracked_evecs[i] = all_evecs[i][:, perm]
+
+    for i in range(start_idx - 1, -1, -1):
+        prev_prev_evals = tracked_evals[i + 2] if i + 2 <= start_idx else None
+        delta_phi = float(phi_vals[i] - phi_vals[i + 1])
+        perm = _match_branches_step(
+            tracked_evals[i + 1],
+            raw_evals[i],
+            tracked_evecs[i + 1],
+            all_evecs[i],
+            delta_phi,
+            prev_prev_evals=prev_prev_evals,
+        )
+        tracked_evals[i] = raw_evals[i][perm]
+        tracked_evecs[i] = all_evecs[i][:, perm]
+
+    return tracked_evals, tracked_evecs
 
 
 def fit_analytical_params_3mode(evals_sweet, phi_sweet=0.0, omega_a_hint=None):
@@ -241,21 +521,20 @@ for i, phi in enumerate(phi_vals):
         print(f"  {i + 1:3d} / {N_FLUX}")
 
 print("\ndoing tracking..")
-all_evals = np.zeros((N_FLUX, N_LEVELS))
-all_evals[0] = raw_evals[0]
-evecs_prev   = all_evecs[0]
-
-for i in range(1, N_FLUX):
-    evals = raw_evals[i].copy()
-    evecs = all_evecs[i]
-    O     = np.abs(evecs.conj().T @ evecs_prev) ** 2
-    row_ind, col_ind = linear_sum_assignment(1 - O)
-    perm = np.empty_like(row_ind)
-    perm[col_ind] = row_ind
-    all_evals[i]  = evals[perm]
-    evecs_prev    = evecs[:, perm]
+all_evals, all_evecs_tracked = track_eigenbranches(raw_evals, all_evecs, phi_vals, mid_idx)
 
 print("Tracking complete.")
+
+# ── Seed labels at sweet spot using identification-style logic ────────────────
+print("\nIdentifying sweet-spot levels using fundamental-frequency anchors...")
+sweet_params = fit_effective_params_3mode(
+    all_evals[mid_idx],
+    omega_r_hint=OMEGA_R_GHZ,
+    omega_q_hint=OMEGA_Q_GHZ,
+    omega_a_hint=OMEGA_A_GHZ,
+)
+sweet_assignments = assign_labels_3mode(all_evals[mid_idx], sweet_params, include_chi=True)
+sweet_labels = {a["k"]: (a["nq"], a["na"], a["nr"]) for a in sweet_assignments}
 
 # ── Fit 3-mode analytical params at sweet spot ────────────────────────────────
 print("\nFitting 3-mode analytical parameters at sweet spot...")
@@ -268,14 +547,9 @@ print(f"  chi_qa  = {analytical_params['chi_qa'] * 1e3:.2f} MHz")
 print(f"  chi_ar  = {analytical_params['chi_ar'] * 1e3:.2f} MHz")
 print(f"  chi_qr  = {analytical_params['chi_qr'] * 1e3:.2f} MHz")
 
-# ── Assign |nq, na, nr> labels at each flux point ────────────────────────────
-print("Assigning |nq, na, nr> labels at flux points")
-level_labels_flux = []
-for i, phi in enumerate(phi_vals):
-    E_rel = all_evals[i] - all_evals[i, 0]
-    linfo = assign_labels(E_rel, phi, analytical_params)
-    d = {k: (nq, na, nr) for k, (nq, na, nr, _) in linfo.items()}
-    level_labels_flux.append(d)
+# ── Propagate the sweet-spot labels along tracked branches ────────────────────
+print("Propagating sweet-spot labels along tracked eigenbranches")
+level_labels_flux = [{k: sweet_labels.get(k, (-1, -1, -1)) for k in range(N_LEVELS)} for _ in range(N_FLUX)]
 
 print(f"\nState labels at Phi = {phi_vals[mid_idx]:.3f} Phi_0 (sweet spot):")
 for k in range(1, N_LEVELS):
@@ -347,8 +621,8 @@ for a in axes:
 E_J_sweet     = float(E_J_squid(0.0))
 omega_q_sweet = float(transmon_energy_levels(E_J_sweet, E_C_eff, n_max=2)[1])
 alpha_q_sweet = float(
-    transmon_energy_levels(E_J_sweet, E_C_eff, n_max=2)[2]
-    - 2 * transmon_energy_levels(E_J_sweet, E_C_eff, n_max=2)[1]
+    2 * transmon_energy_levels(E_J_sweet, E_C_eff, n_max=2)[1]
+    - transmon_energy_levels(E_J_sweet, E_C_eff, n_max=2)[2]
 )
 
 print("\n--- Analytical three-mode model parameters ---")

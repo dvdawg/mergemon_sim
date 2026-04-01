@@ -38,6 +38,18 @@ def _identify_omega_r_from_hint(E, omega_r_hint):
     return float(E[k]), k
 
 
+def _match_nearest_unused_level(E, target, used_indices=None):
+    E = np.asarray(E)
+    if used_indices is None:
+        used_indices = set()
+    order = np.argsort(np.abs(E - target))
+    for idx in order:
+        idx = int(idx)
+        if idx not in used_indices:
+            return idx
+    raise ValueError("No unused energy levels available for matching.")
+
+
 def fit_effective_params_3mode(
     evals_rel,
     tol_nonmultiple=0.20,
@@ -123,9 +135,11 @@ def fit_effective_params_3mode(
             omega_a = float(E[3]) if len(E) > 3 else float(E[2])
 
     # ── Step 4: alpha_q from |2,0,0> ─────────────────────────────────────────
+    # Report alpha_q as the positive anharmonicity magnitude:
+    #   alpha_q = f_01 - f_12 = 2*omega_q - E|2,0,0>  ~ E_C
     target_2q = 2.0 * omega_q
     idx_2q = int(np.argmin(np.abs(E - target_2q)))
-    alpha_q = float(E[idx_2q] - target_2q)
+    alpha_q = float(target_2q - E[idx_2q])
 
     # ── Steps 5-7: ancilla-involving quantities ───────────────────────────────
     if ancilla_above_spectrum:
@@ -136,7 +150,7 @@ def fit_effective_params_3mode(
     else:
         target_2a = 2.0 * omega_a
         idx_2a    = int(np.argmin(np.abs(E - target_2a)))
-        alpha_a   = float(E[idx_2a] - target_2a)
+        alpha_a   = float(target_2a - E[idx_2a])
 
         target_qa = omega_q + omega_a
         idx_qa    = int(np.argmin(np.abs(E - target_qa)))
@@ -168,8 +182,8 @@ def predicted_energy_3mode(nq, na, nr, p, include_chi=True):
     """
     Predicted energy of state |nq, na, nr> from the 3-mode Hamiltonian:
 
-    H = omega_q*nq + alpha_q/2 * nq*(nq-1)
-      + omega_a*na + alpha_a/2 * na*(na-1)
+    H = omega_q*nq - alpha_q/2 * nq*(nq-1)
+      + omega_a*na - alpha_a/2 * na*(na-1)
       + omega_r*nr
       + chi_qa*nq*na + chi_ar*na*nr + chi_qr*nq*nr
     """
@@ -183,9 +197,9 @@ def predicted_energy_3mode(nq, na, nr, p, include_chi=True):
     chi_qr = p["chi_qr"] if include_chi else 0.0
     return (
         omega_q * nq
-        + 0.5 * alpha_q * nq * (nq - 1)
+        - 0.5 * alpha_q * nq * (nq - 1)
         + omega_a * na
-        + 0.5 * alpha_a * na * (na - 1)
+        - 0.5 * alpha_a * na * (na - 1)
         + omega_r * nr
         + chi_qa * nq * na
         + chi_ar * na * nr
@@ -205,9 +219,47 @@ def assign_labels_3mode(evals_rel, p, nq_max=4, na_max=4, nr_max=8, include_chi=
                 cand.append((Ep, nq, na, nr))
     cand.sort(key=lambda t: t[0])
 
+    # Anchor the single-mode ladders first using integer multiples of the
+    # identified fundamentals: f_q, f_a, f_r, then 2*f_q, 2*f_a, 2*f_r, etc.
+    e_max = float(E[-1])
+    anchor_specs = [(0.0, 0, 0, 0)]
+    for nq in range(1, nq_max + 1):
+        target = nq * p["omega_q"]
+        if target <= e_max + 1.0:
+            anchor_specs.append((target, nq, 0, 0))
+    for na in range(1, na_max + 1):
+        target = na * p["omega_a"]
+        if target <= e_max + 1.0:
+            anchor_specs.append((target, 0, na, 0))
+    for nr in range(1, nr_max + 1):
+        target = nr * p["omega_r"]
+        if target <= e_max + 1.0:
+            anchor_specs.append((target, 0, 0, nr))
+    anchor_specs.sort(key=lambda t: t[0])
+
     used = set()
+    used_energy_indices = set()
+    anchored_by_index = {}
+    for target, nq, na, nr in anchor_specs:
+        idx = _match_nearest_unused_level(E, target, used_energy_indices)
+        anchored_by_index[idx] = dict(
+            k=idx,
+            E=E[idx],
+            nq=nq,
+            na=na,
+            nr=nr,
+            E_pred=predicted_energy_3mode(nq, na, nr, p, include_chi=include_chi),
+            resid=abs(E[idx] - target),
+        )
+        used.add((nq, na, nr))
+        used_energy_indices.add(idx)
+
     out = []
     for k, Ek in enumerate(E):
+        if k in anchored_by_index:
+            out.append(anchored_by_index[k])
+            continue
+
         best = None
         best_score = 1e99
 
@@ -281,10 +333,10 @@ if above:
     print(f"  chi_ar  : not observable from low-energy spectrum")
 else:
     print(f"  omega_a = {params['omega_a']:.6f}  (hint {OMEGA_A_HINT:.3f} GHz, nearest level in spectrum)")
-    print(f"  alpha_a = {params['alpha_a']:.6f}")
+    print(f"  alpha_a = {params['alpha_a']:.6f}  (= f_a01 - f_a12)")
     print(f"  chi_qa  = {params['chi_qa']:.6f}  (= E|1,1,0> - E|0,1,0> - E|1,0,0>)")
     print(f"  chi_ar  = {params['chi_ar']:.6f}  (= E|0,1,1> - E|0,0,1> - E|0,1,0>)")
-print(f"  alpha_q = {params['alpha_q']:.6f}")
+print(f"  alpha_q = {params['alpha_q']:.6f}  (= f_q01 - f_q12)")
 print(f"  chi_qr  = {params['chi_qr']:.6f}  (= E|1,0,1> - E|0,0,1> - E|1,0,0>)")
 
 

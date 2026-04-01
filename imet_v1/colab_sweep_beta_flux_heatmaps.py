@@ -14,6 +14,15 @@ import csv
 import time
 from scipy.optimize import linear_sum_assignment
 
+L_r_orig = 0.50e-9
+C_r = 0.80e-12
+L_c_orig = 0.16e-9
+L_J1 = 30.0e-9
+L_J2 = 30.0e-9
+C_J1 = 40e-15
+C_J2 = 40e-15
+
+L_tot = L_r_orig + L_c_orig
 
 class HiddenPrints:
     def __enter__(self):
@@ -149,17 +158,6 @@ def assign_labels_2mode(evals_rel, p, nq_max=6, nr_max=10, include_chi=True):
         out.append(dict(k=k, E=Ek, nq=nq, nr=nr, E_pred=Ep, resid=resid))
 
     return out
-
-
-L_r_orig = 0.50e-9
-C_r = 0.80e-12
-L_c_orig = 0.16e-9
-L_J1 = 30.0e-9
-L_J2 = 30.0e-9
-C_J1 = 40e-15
-C_J2 = 40e-15
-
-L_tot = L_r_orig + L_c_orig
 
 PHI0 = 2.067833848e-15
 E_CHARGE = 1.602176634e-19

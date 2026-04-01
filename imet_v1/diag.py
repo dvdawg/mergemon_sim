@@ -2,9 +2,9 @@ import numpy as np
 import scqubits as scq
 
 # params given
-L_r  = 0.50e-9
-C_r  = 0.80e-12
-L_c  = 0.16e-9
+L_r  = 0.05e-9
+C_r  = 5.281e-12
+L_c  = 0.05e-9
 L_J1 = 30.0e-9
 L_J2 = 30.0e-9
 C_J1 = 40e-15

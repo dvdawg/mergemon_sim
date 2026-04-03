@@ -14,6 +14,7 @@ DESIGN_GRAPH_TEXT = """branches:
 - [C, 0, 3, 45fF]
 
 - [JJ, 1, 3, 2nH]
+- [C, 1, 3, 675fF]
 
 - [C, 1, 2, 14fF]
 - [L, 2, 3, 2.2nH]
@@ -133,13 +134,17 @@ def get_qubit_params(path: str = None) -> tuple:
         key = (min(n1, n2), max(n1, n2))
         by_pair.setdefault(key, []).append((btype, val))
 
+    shunted_jjs = []
     for btype, n1, n2, val in branches:
         if btype != "JJ":
             continue
         key = (min(n1, n2), max(n1, n2))
         caps = [v for bt, v in by_pair.get(key, []) if bt == "C"]
         if caps:
-            return val, caps[0]
+            shunted_jjs.append((val, min(caps)))
+
+    if shunted_jjs:
+        return min(shunted_jjs, key=lambda item: item[1])
     raise ValueError("Could not find qubit JJ with direct shunt capacitor in design_graph")
 
 
@@ -150,22 +155,36 @@ def get_ancilla_params(path: str = None) -> tuple:
         key = (min(n1, n2), max(n1, n2))
         by_pair.setdefault(key, []).append((btype, val))
 
+    shunted_jjs = []
     for btype, n1, n2, val in branches:
         if btype != "JJ":
             continue
         key = (min(n1, n2), max(n1, n2))
         direct_caps = [v for bt, v in by_pair.get(key, []) if bt == "C"]
-        if not direct_caps:
-            adj_caps = []
-            for bt2, n1_2, n2_2, val2 in branches:
-                key2 = (min(n1_2, n2_2), max(n1_2, n2_2))
-                if bt2 != "C" or key2 == key:
-                    continue
-                if n1_2 == n1 or n1_2 == n2 or n2_2 == n1 or n2_2 == n2:
-                    adj_caps.append(val2)
-            if adj_caps:
-                return val, min(adj_caps)
-    raise ValueError("Could not find ancilla JJ (JJ with no direct shunt cap) in design_graph")
+        if direct_caps:
+            shunted_jjs.append((val, min(direct_caps)))
+
+    if len(shunted_jjs) >= 2:
+        return max(shunted_jjs, key=lambda item: item[1])
+
+    for btype, n1, n2, val in branches:
+        if btype != "JJ":
+            continue
+        key = (min(n1, n2), max(n1, n2))
+        direct_caps = [v for bt, v in by_pair.get(key, []) if bt == "C"]
+        if direct_caps:
+            continue
+
+        adj_caps = []
+        for bt2, n1_2, n2_2, val2 in branches:
+            key2 = (min(n1_2, n2_2), max(n1_2, n2_2))
+            if bt2 != "C" or key2 == key:
+                continue
+            if n1_2 == n1 or n1_2 == n2 or n2_2 == n1 or n2_2 == n2:
+                adj_caps.append(val2)
+        if adj_caps:
+            return val, min(adj_caps)
+    raise ValueError("Could not determine ancilla JJ and capacitance from design_graph")
 
 
 def get_resonator_params(path: str = None) -> tuple:
@@ -193,16 +212,16 @@ def get_resonator_params(path: str = None) -> tuple:
 # Design parameters read directly from design_graph.txt
 L_r, C_r           = get_resonator_params()   # resonator L and C
 L_J_q, C_shunt_q   = get_qubit_params()       # SQUID JJ + shunt cap
-L_J_a, C_coupling_a = get_ancilla_params()    # ancilla JJ + coupling cap
+L_J_a, C_ancilla_a = get_ancilla_params()     # ancilla JJ + ancilla capacitance
 
 # Bare LC frequency hints (GHz):  omega = 1/sqrt(L*C)
 OMEGA_R_GHZ = 1.0 / (np.sqrt(L_r   * C_r)           * 2 * np.pi * 1e9)
 OMEGA_Q_GHZ = 1.0 / (np.sqrt(L_J_q * C_shunt_q)     * 2 * np.pi * 1e9)
-OMEGA_A_GHZ = 1.0 / (np.sqrt(L_J_a * C_coupling_a)  * 2 * np.pi * 1e9)
+OMEGA_A_GHZ = 1.0 / (np.sqrt(L_J_a * C_ancilla_a)   * 2 * np.pi * 1e9)
 
 print(f"Resonator: L_r={L_r*1e9:.2f} nH, C_r={C_r*1e12:.1f} pF  →  f_r_hint={OMEGA_R_GHZ:.4f} GHz")
 print(f"Qubit:     L_J={L_J_q*1e9:.1f} nH, C={C_shunt_q*1e15:.0f} fF      →  f_q_hint={OMEGA_Q_GHZ:.4f} GHz")
-print(f"Ancilla:   L_J={L_J_a*1e9:.1f} nH, C={C_coupling_a*1e15:.0f} fF     →  f_a_hint={OMEGA_A_GHZ:.4f} GHz")
+print(f"Ancilla:   L_J={L_J_a*1e9:.1f} nH, C={C_ancilla_a*1e15:.0f} fF      →  f_a_hint={OMEGA_A_GHZ:.4f} GHz")
 
 E_J_data = inductive_energy_ghz(L_J_q)    # single SQUID junction E_J (GHz)
 E_C_eff  = charging_energy_ghz(C_shunt_q) # qubit charging energy (shunt cap dominates)
@@ -568,7 +587,7 @@ def fit_analytical_params_3mode(evals_sweet, phi_sweet=0.0, omega_a_hint=None):
     Fit omega_a, alpha_a, chi_qa, chi_ar, chi_qr from the sweet-spot spectrum
     by minimising the Hungarian-assignment cost against the 3-mode prediction.
 
-    omega_a_hint (GHz): physical LC estimate 1/(2*pi*sqrt(L_J_a * C_coupling)).
+    omega_a_hint (GHz): physical LC estimate 1/(2*pi*sqrt(L_J_a * C_ancilla)).
     Used as the initial guess.  If omega_a_hint is above the spectrum, omega_a
     is fixed at the hint and only the chi values are optimised.
 

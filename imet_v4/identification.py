@@ -7,7 +7,6 @@ from circuit_from_design import (
     charging_energy_ghz,
 )
 
-
 def _peak_spacing_from_pairwise_diffs(energies, min_diff=1.0, bin_width=0.05):
     energies = np.array(sorted(energies))
     diffs = []
@@ -69,7 +68,7 @@ def fit_effective_params_3mode(
     Physical frequency hints (GHz) from the design LC formulas:
         omega_r_hint  ~  1/(2*pi*sqrt(L_r * C_r))
         omega_q_hint  ~  1/(2*pi*sqrt(L_J_qubit * C_shunt))
-        omega_a_hint  ~  1/(2*pi*sqrt(L_J_ancilla * C_coupling))
+        omega_a_hint  ~  1/(2*pi*sqrt(L_J_ancilla * C_ancilla))
 
     When a hint is supplied, the nearest spectral level to that hint is used
     as the mode frequency.  If omega_a_hint falls above the computed spectrum
@@ -297,21 +296,24 @@ def assign_labels_3mode(evals_rel, p, nq_max=4, na_max=4, nr_max=8, include_chi=
 # ── Physical LC frequency hints from design_graph.txt ─────────────────────────
 # omega_r = 1/sqrt(L_r * C_r)           (resonator inductor and capacitor)
 # omega_q = 1/sqrt(L_J_qubit * C_shunt)  (SQUID junction + shunt cap)
-# omega_a = 1/sqrt(L_J_ancilla * C_coupling) (ancilla junction + coupling cap)
+# omega_a = 1/sqrt(L_J_ancilla * C_ancilla) (ancilla junction + ancilla capacitance)
 
 L_J_q, C_shunt_q     = get_qubit_params()
-L_J_a, C_coupling_a  = get_ancilla_params()
+L_J_a, C_ancilla_a   = get_ancilla_params()
+
+print(f"L_J_q: {L_J_q}, C_shunt_q: {C_shunt_q}")
+print(f"L_J_a: {L_J_a}, C_ancilla_a: {C_ancilla_a}")
 
 OMEGA_R_HINT = f_res_bare
 OMEGA_Q_HINT = 1.0 / (np.sqrt(L_J_q * C_shunt_q)    * 2 * np.pi * 1e9)
-OMEGA_A_HINT = 1.0 / (np.sqrt(L_J_a * C_coupling_a) * 2 * np.pi * 1e9)
+OMEGA_A_HINT = 1.0 / (np.sqrt(L_J_a * C_ancilla_a) * 2 * np.pi * 1e9)
 
 print("\n[Physical LC frequency hints from design_graph.txt]")
 print(f"  omega_r_hint = 1/sqrt(L_r*C_r)           = {OMEGA_R_HINT:.4f} GHz")
 print(f"  omega_q_hint = 1/sqrt(L_J_q*C_shunt)     = {OMEGA_Q_HINT:.4f} GHz"
       f"  (L_J={L_J_q*1e9:.1f} nH, C={C_shunt_q*1e15:.0f} fF)")
-print(f"  omega_a_hint = 1/sqrt(L_J_a*C_coupling)  = {OMEGA_A_HINT:.4f} GHz"
-      f"  (L_J={L_J_a*1e9:.1f} nH, C={C_coupling_a*1e15:.0f} fF)")
+print(f"  omega_a_hint = 1/sqrt(L_J_a*C_ancilla)   = {OMEGA_A_HINT:.4f} GHz"
+      f"  (L_J={L_J_a*1e9:.1f} nH, C={C_ancilla_a*1e15:.0f} fF)")
 
 params = fit_effective_params_3mode(
     evals_rel,

@@ -140,8 +140,8 @@ def get_qubit_params(path: str = None) -> tuple:
     """
     Return (L_J, C_shunt) in SI for the qubit SQUID arm.
 
-    The qubit JJ is identified as a JJ that has a direct shunt capacitor on
-    the same node pair (e.g. JJ(0,1) paired with C(0,1)).  Returns the first
+    The qubit JJ is identified as the direct-shunted JJ with the smallest
+    shunt capacitance (e.g. JJ(0,1) paired with C(0,1)). Returns the first
     such (L_J, C_shunt) pair found — for a symmetric SQUID all arms are equal.
 
     Bare qubit frequency hint:  omega_q = 1 / sqrt(L_J * C_shunt)
@@ -153,27 +153,31 @@ def get_qubit_params(path: str = None) -> tuple:
         key = (min(n1, n2), max(n1, n2))
         by_pair.setdefault(key, []).append((btype, val))
 
+    shunted_jjs = []
     for btype, n1, n2, val in branches:
         if btype != "JJ":
             continue
         key = (min(n1, n2), max(n1, n2))
         caps = [v for bt, v in by_pair.get(key, []) if bt == "C"]
         if caps:
-            return val, caps[0]   # (L_J, C_shunt)
+            shunted_jjs.append((val, min(caps)))
+
+    if shunted_jjs:
+        return min(shunted_jjs, key=lambda item: item[1])
 
     raise ValueError("Could not find qubit JJ with direct shunt capacitor in design_graph")
 
 
 def get_ancilla_params(path: str = None) -> tuple:
     """
-    Return (L_J, C_coupling) in SI for the ancilla mode.
+    Return (L_J, C_ancilla) in SI for the ancilla mode.
 
-    The ancilla JJ is identified as a JJ with *no* direct shunt capacitor on
-    the same node pair (it is the coupling/ancilla junction).  The coupling
-    capacitance is the smallest C that shares exactly one node with the ancilla
-    JJ (i.e. the adjacent coupling cap, not the resonator cap).
+    Prefer the ancilla JJ's direct shunt capacitor on the same node pair. If
+    the design has no direct-shunted ancilla JJ, fall back to the legacy rule:
+    choose the unshunted JJ and use the smallest adjacent capacitor that shares
+    exactly one node with that JJ.
 
-    Bare ancilla frequency hint:  omega_a = 1 / sqrt(L_J * C_coupling)
+    Bare ancilla frequency hint:  omega_a = 1 / sqrt(L_J * C_ancilla)
     """
     branches = _parse_branches(path)
     by_pair = {}
@@ -181,27 +185,39 @@ def get_ancilla_params(path: str = None) -> tuple:
         key = (min(n1, n2), max(n1, n2))
         by_pair.setdefault(key, []).append((btype, val))
 
+    shunted_jjs = []
     for btype, n1, n2, val in branches:
         if btype != "JJ":
             continue
         key = (min(n1, n2), max(n1, n2))
         direct_caps = [v for bt, v in by_pair.get(key, []) if bt == "C"]
-        if not direct_caps:
-            # This is the ancilla JJ — find smallest adjacent C
-            L_J = val
-            adj_caps = []
-            for bt2, n1_2, n2_2, val2 in branches:
-                if bt2 != "C":
-                    continue
-                key2 = (min(n1_2, n2_2), max(n1_2, n2_2))
-                if key2 == key:
-                    continue  # skip any direct cap on the same pair
-                if n1_2 == n1 or n1_2 == n2 or n2_2 == n1 or n2_2 == n2:
-                    adj_caps.append(val2)
-            if adj_caps:
-                return L_J, min(adj_caps)   # (L_J, C_coupling)
+        if direct_caps:
+            shunted_jjs.append((val, min(direct_caps)))
 
-    raise ValueError("Could not find ancilla JJ (JJ with no direct shunt cap) in design_graph")
+    if len(shunted_jjs) >= 2:
+        return max(shunted_jjs, key=lambda item: item[1])
+
+    for btype, n1, n2, val in branches:
+        if btype != "JJ":
+            continue
+        key = (min(n1, n2), max(n1, n2))
+        direct_caps = [v for bt, v in by_pair.get(key, []) if bt == "C"]
+        if direct_caps:
+            continue
+
+        adj_caps = []
+        for bt2, n1_2, n2_2, val2 in branches:
+            if bt2 != "C":
+                continue
+            key2 = (min(n1_2, n2_2), max(n1_2, n2_2))
+            if key2 == key:
+                continue
+            if n1_2 == n1 or n1_2 == n2 or n2_2 == n1 or n2_2 == n2:
+                adj_caps.append(val2)
+        if adj_caps:
+            return val, min(adj_caps)
+
+    raise ValueError("Could not determine ancilla JJ and capacitance from design_graph")
 
 
 def get_resonator_params(path: str = None) -> tuple:

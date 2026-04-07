@@ -6,6 +6,7 @@ import scqubits as scq
 from scipy.optimize import linear_sum_assignment, minimize
 
 from circuit_from_design import (
+    apply_recommended_cutoffs,
     build_circuit as build_circuit_from_design,
     get_resonator_params,
     get_qubit_params,
@@ -448,6 +449,7 @@ def fit_analytical_params_3mode(evals_sweet, phi_sweet=0.0, omega_a_hint=None):
 
 print("Building circuit from design_graph.txt...")
 circ, _ = build_circuit_from_design()
+apply_recommended_cutoffs(circ, periodic_cutoff=8, extended_cutoff=12)
 
 flux_syms  = circ.external_fluxes
 flux_attrs = [str(s) for s in flux_syms]

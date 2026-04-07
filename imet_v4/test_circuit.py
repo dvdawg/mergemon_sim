@@ -2,12 +2,14 @@ import time
 import numpy as np
 import scqubits as scq
 
-from circuit_from_design import build_circuit as build_circuit_from_design
+from circuit_from_design import (
+    apply_recommended_cutoffs,
+    build_circuit as build_circuit_from_design,
+)
 
 circ, _ = build_circuit_from_design()
-print("Cutoffs:", getattr(circ, "cutoff_names", []))
-for name in getattr(circ, "cutoff_names", []):
-    setattr(circ, name, 3)
+apply_recommended_cutoffs(circ, periodic_cutoff=8, extended_cutoff=12)
+print("Cutoffs:", circ.get_cutoffs())
 
 start = time.time()
 ev, _ = circ.eigensys(evals_count=3)

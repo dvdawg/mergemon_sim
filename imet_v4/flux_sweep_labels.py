@@ -6,6 +6,7 @@ import scqubits as scq
 from scipy.optimize import linear_sum_assignment, minimize
 
 from circuit_from_design import (
+    apply_recommended_cutoffs,
     build_circuit as build_circuit_from_design,
     get_resonator_params,
     get_qubit_params,
@@ -143,6 +144,25 @@ def predict_3mode(phi_ext, analytical_params):
                     + chi_qr * nq * nr
                 )
                 preds[(nq, na, nr)] = E
+    return preds
+
+
+def predict_3mode_from_sweet_anchor(phi_ext, sweet_energy_by_label, phi_ref=0.0):
+    """
+    Predict the flux evolution by anchoring every labelled state to its
+    *numerical* sweet-spot energy and only applying the SQUID-induced qubit
+    shift away from that point.
+
+    This keeps the comparison panel aligned with the trusted sweet-spot
+    diagonalization/identification while still showing the intended analytical
+    flux trend.
+    """
+    eq_ref = transmon_energy_levels(float(E_J_squid(phi_ref)), E_C_eff, n_max=NQ_MAX)
+    eq_phi = transmon_energy_levels(float(E_J_squid(phi_ext)), E_C_eff, n_max=NQ_MAX)
+
+    preds = {}
+    for (nq, na, nr), E_sweet in sweet_energy_by_label.items():
+        preds[(nq, na, nr)] = float(E_sweet + (eq_phi[nq] - eq_ref[nq]))
     return preds
 
 
@@ -464,6 +484,7 @@ def fit_analytical_params_3mode(evals_sweet, phi_sweet=0.0, omega_a_hint=None):
 # ── Build circuit ──────────────────────────────────────────────────────────────
 print("\nBuilding circuit from design_graph.txt...")
 circ, _ = build_circuit_from_design()
+apply_recommended_cutoffs(circ, periodic_cutoff=8, extended_cutoff=12)
 
 flux_syms  = circ.external_fluxes
 flux_attrs = [str(s) for s in flux_syms]
@@ -535,6 +556,7 @@ sweet_params = fit_effective_params_3mode(
 )
 sweet_assignments = assign_labels_3mode(all_evals[mid_idx], sweet_params, include_chi=True)
 sweet_labels = {a["k"]: (a["nq"], a["na"], a["nr"]) for a in sweet_assignments}
+sweet_energy_by_label = {(a["nq"], a["na"], a["nr"]): a["E"] for a in sweet_assignments}
 
 # ── Fit 3-mode analytical params at sweet spot ────────────────────────────────
 print("\nFitting 3-mode analytical parameters at sweet spot...")
@@ -547,19 +569,18 @@ print(f"  chi_qa  = {analytical_params['chi_qa'] * 1e3:.2f} MHz")
 print(f"  chi_ar  = {analytical_params['chi_ar'] * 1e3:.2f} MHz")
 print(f"  chi_qr  = {analytical_params['chi_qr'] * 1e3:.2f} MHz")
 
-# ── Propagate the sweet-spot labels along tracked branches ────────────────────
-print("Propagating sweet-spot labels along tracked eigenbranches")
-level_labels_flux = [{k: sweet_labels.get(k, (-1, -1, -1)) for k in range(N_LEVELS)} for _ in range(N_FLUX)]
+# ── Attach one label to each tracked branch ───────────────────────────────────
+print("Attaching sweet-spot labels to tracked branches")
+tracked_branch_labels = {k: sweet_labels.get(k, (-1, -1, -1)) for k in range(N_LEVELS)}
 
 print(f"\nState labels at Phi = {phi_vals[mid_idx]:.3f} Phi_0 (sweet spot):")
 for k in range(1, N_LEVELS):
-    nq, na, nr = level_labels_flux[mid_idx].get(k, (-1, -1, -1))
+    nq, na, nr = tracked_branch_labels.get(k, (-1, -1, -1))
     print(f"tracked level {k:2d} -> |{nq},{na},{nr}>, E = {all_evals[mid_idx, k]:.4f} GHz")
 
 # ── Plotting ──────────────────────────────────────────────────────────────────
 all_qn_labels = set()
-for d in level_labels_flux:
-    all_qn_labels.update(d.values())
+all_qn_labels.update(tracked_branch_labels.values())
 
 all_qn_labels.discard((0, 0, 0))
 all_qn_labels = sorted(all_qn_labels, key=lambda x: (x[0], x[1], x[2]))
@@ -577,7 +598,7 @@ for lbl in all_qn_labels:
     E_curve = np.full(N_FLUX, np.nan)
     for i in range(N_FLUX):
         for k in range(1, N_LEVELS):
-            if level_labels_flux[i].get(k) == lbl:
+            if tracked_branch_labels.get(k) == lbl:
                 E_curve[i] = all_evals[i, k]
                 break
     if not np.all(np.isnan(E_curve)):
@@ -598,7 +619,11 @@ ax2 = axes[1]
 for lbl in all_qn_labels:
     nq, na, nr = lbl
     E_pred = np.array([
-        predict_3mode(phi, analytical_params).get((nq, na, nr), np.nan)
+        predict_3mode_from_sweet_anchor(
+            phi,
+            sweet_energy_by_label,
+            phi_ref=float(phi_vals[mid_idx]),
+        ).get((nq, na, nr), np.nan)
         for phi in phi_vals
     ])
     ax2.plot(
@@ -609,7 +634,7 @@ for lbl in all_qn_labels:
 
 ax2.set_xlabel(r"External flux $\Phi_\mathrm{ext}/\Phi_0$", fontsize=AXIS_LABEL_FONTSIZE)
 ax2.set_ylabel("Energy (GHz)", fontsize=AXIS_LABEL_FONTSIZE)
-ax2.set_title("Analytical three-mode model", fontsize=TITLE_FONTSIZE)
+ax2.set_title("Sweet-spot anchored three-mode trend", fontsize=TITLE_FONTSIZE)
 ax2.legend(frameon=False, ncols=2, fontsize=LEGEND_FONTSIZE, loc="upper right")
 ax2.grid(True, alpha=0.25)
 

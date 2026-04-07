@@ -1,9 +1,14 @@
 import numpy as np
 import scqubits as scq
 
-from circuit_from_design import build_circuit as build_circuit_from_design, get_resonator_params
+from circuit_from_design import (
+    apply_recommended_cutoffs,
+    build_circuit as build_circuit_from_design,
+    get_resonator_params,
+)
 
 circ, iMET_yaml = build_circuit_from_design()
+apply_recommended_cutoffs(circ, periodic_cutoff=12, extended_cutoff=18)
 print(iMET_yaml)
 
 L_r, C_r = get_resonator_params()

@@ -5,6 +5,8 @@ import warnings
 import sys
 import os
 
+from circuit_from_design import apply_recommended_cutoffs
+
 
 class HiddenPrints:
     def __enter__(self):
@@ -77,9 +79,7 @@ branches:
     try:
         with HiddenPrints():
             circ = scq.Circuit(iMET_yaml, from_file=False, ext_basis="harmonic")
-            circ.cutoff_n_1 = 6
-            circ.cutoff_ext_2 = 10
-            circ.cutoff_ext_3 = 10
+            apply_recommended_cutoffs(circ, periodic_cutoff=6, extended_cutoff=10)
 
             _flux_syms = getattr(circ, "external_fluxes", None)
             if _flux_syms is not None and len(_flux_syms) > 0:
@@ -198,4 +198,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -112,6 +112,49 @@ def build_circuit(from_file_path: str = None, ext_basis: str = "harmonic", **kwa
     return circ, yaml_str
 
 
+def recommended_cutoffs(circ, periodic_cutoff: int = 12, extended_cutoff: int = 18) -> dict:
+    """
+    Return cutoff settings keyed by the *actual* variable types in ``circ``.
+
+    imet_v4 does not have the same variable layout as the older hand-written
+    model: it has two periodic variables and one extended variable.  Using the
+    old hard-coded cutoff names (for example ``cutoff_ext_2``) silently leaves
+    one periodic coordinate under-truncated, which distorts the low-energy
+    spectrum.
+    """
+    categories = getattr(circ, "var_categories", {}) or {}
+    cutoffs = {}
+
+    for idx in categories.get("periodic", []):
+        cutoffs[f"cutoff_n_{idx}"] = int(periodic_cutoff)
+    for idx in categories.get("extended", []):
+        cutoffs[f"cutoff_ext_{idx}"] = int(extended_cutoff)
+
+    return cutoffs
+
+
+def apply_recommended_cutoffs(
+    circ,
+    periodic_cutoff: int = 12,
+    extended_cutoff: int = 18,
+    overrides: dict | None = None,
+):
+    """
+    Apply topology-aware cutoff settings to a circuit and return the circuit.
+    """
+    cutoffs = recommended_cutoffs(
+        circ,
+        periodic_cutoff=periodic_cutoff,
+        extended_cutoff=extended_cutoff,
+    )
+    if overrides:
+        cutoffs.update(overrides)
+
+    for name, value in cutoffs.items():
+        setattr(circ, name, value)
+    return circ
+
+
 def _parse_branches(path=None):
     """
     Parse all branches from design_graph.txt.

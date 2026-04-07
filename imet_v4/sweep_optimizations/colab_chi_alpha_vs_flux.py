@@ -106,6 +106,15 @@ def build_circuit_from_design(from_file_path: str = None, ext_basis: str = "harm
     return circ, yaml_str
 
 
+def apply_recommended_cutoffs(circ, periodic_cutoff: int = 8, extended_cutoff: int = 12):
+    categories = getattr(circ, "var_categories", {}) or {}
+    for idx in categories.get("periodic", []):
+        setattr(circ, f"cutoff_n_{idx}", int(periodic_cutoff))
+    for idx in categories.get("extended", []):
+        setattr(circ, f"cutoff_ext_{idx}", int(extended_cutoff))
+    return circ
+
+
 def _parse_branches(path=None):
     if path is None:
         content = DESIGN_GRAPH_TEXT
@@ -644,6 +653,7 @@ def fit_analytical_params_3mode(evals_sweet, phi_sweet=0.0, omega_a_hint=None):
 
 print("Building circuit from design_graph.txt...")
 circ, _ = build_circuit_from_design()
+apply_recommended_cutoffs(circ)
 
 flux_syms  = circ.external_fluxes
 flux_attrs = [str(s) for s in flux_syms]

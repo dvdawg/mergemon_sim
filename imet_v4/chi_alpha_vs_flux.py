@@ -539,7 +539,8 @@ tracked_branch_labels = {k: sweet_labels.get(k, (-1, -1, -1)) for k in range(N_L
 # ── Extract chi and alpha vs flux ─────────────────────────────────────────────
 alpha_q_vals = np.full(N_FLUX, np.nan)
 alpha_r_vals = np.full(N_FLUX, np.nan)
-chi_qr_vals  = np.full(N_FLUX, np.nan)
+chi_qa_vals  = np.full(N_FLUX, np.nan)
+chi_ar_vals  = np.full(N_FLUX, np.nan)
 
 for i in range(N_FLUX):
     qn_to_E = {
@@ -551,8 +552,11 @@ for i in range(N_FLUX):
     E_000 = qn_to_E.get((0, 0, 0))
     E_100 = qn_to_E.get((1, 0, 0))
     E_200 = qn_to_E.get((2, 0, 0))
+    E_010 = qn_to_E.get((0, 1, 0))
     E_001 = qn_to_E.get((0, 0, 1))
     E_002 = qn_to_E.get((0, 0, 2))
+    E_110 = qn_to_E.get((1, 1, 0))
+    E_011 = qn_to_E.get((0, 1, 1))
     E_101 = qn_to_E.get((1, 0, 1))
 
     # Positive anharmonicity convention: alpha = f01 - f12
@@ -562,18 +566,23 @@ for i in range(N_FLUX):
     if all(x is not None for x in [E_000, E_001, E_002]):
         alpha_r_vals[i] = 2.0 * E_001 - E_002 - E_000
 
-    if all(x is not None for x in [E_000, E_100, E_001, E_101]):
-        chi_qr_vals[i] = (E_101 - E_001) - (E_100 - E_000)
+    if all(x is not None for x in [E_000, E_100, E_010, E_110]):
+        chi_qa_vals[i] = (E_110 - E_010) - (E_100 - E_000)
+
+    if all(x is not None for x in [E_000, E_010, E_001, E_011]):
+        chi_ar_vals[i] = (E_011 - E_001) - (E_010 - E_000)
 
 alpha_q_mhz = alpha_q_vals * 1e3
 alpha_r_mhz = alpha_r_vals * 1e3
-chi_qr_mhz  = chi_qr_vals  * 1e3
+chi_qa_mhz  = chi_qa_vals  * 1e3
+chi_ar_mhz  = chi_ar_vals  * 1e3
 
 print(f"\n--- Values at sweet spot (Phi = {phi_vals[mid_idx]:.3f} Phi_0) ---")
 for name, arr in [
     ("alpha_q", alpha_q_mhz),
     ("alpha_r", alpha_r_mhz),
-    ("chi_qr",  chi_qr_mhz),
+    ("chi_qa",  chi_qa_mhz),
+    ("chi_ar",  chi_ar_mhz),
 ]:
     v = arr[mid_idx]
     s = f"{v:.2f}" if not np.isnan(v) else "N/A"
@@ -592,15 +601,16 @@ def _finite_bounds(arrays, pad_frac=0.08, min_span=1.0):
 # ── Plot ──────────────────────────────────────────────────────────────────────
 fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
 
-ax1.plot(phi_vals, chi_qr_mhz, color="C0", linewidth=1.8, label=r"$\chi_{qr}$")
+ax1.plot(phi_vals, chi_qa_mhz, color="C0", linewidth=1.8, label=r"$\chi_{qa}$")
+ax1.plot(phi_vals, chi_ar_mhz, color="C2", linewidth=1.8, label=r"$\chi_{ar}$")
 ax1.set_ylabel(r"$\chi\,/\,2\pi$ (MHz)", fontsize=12)
-ax1.set_title("Qubit-Resonator Dispersive Shift vs External Flux", fontsize=13)
+ax1.set_title("Cross-Kerr Couplings vs External Flux", fontsize=13)
 ax1.axhline(0, color="gray", linewidth=0.5, linestyle="--")
 ax1.axvline(0, color="gray", linewidth=0.5, linestyle="--", alpha=0.5)
 ax1.legend(fontsize=11)
 ax1.grid(True, alpha=0.25)
 ax1.set_xlim(float(phi_vals[0]), float(phi_vals[-1]))
-ax1.set_ylim(*_finite_bounds([chi_qr_mhz], pad_frac=0.10, min_span=0.2))
+ax1.set_ylim(*_finite_bounds([chi_qa_mhz, chi_ar_mhz], pad_frac=0.10, min_span=0.2))
 
 ax2.plot(phi_vals, alpha_q_mhz, color="C1", linewidth=1.6, label=r"$\alpha_q$")
 ax2.plot(phi_vals, alpha_r_mhz, color="C4", linewidth=1.6, label=r"$\alpha_r$")

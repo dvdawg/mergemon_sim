@@ -532,9 +532,9 @@ print(f"  omega_a = {analytical_params['omega_a']:.4f} GHz")
 print(f"  alpha_a = {analytical_params['alpha_a'] * 1e3:.1f} MHz")
 print(f"  chi_qr  = {analytical_params['chi_qr'] * 1e3:.2f} MHz")
 
-# ── Propagate sweet-spot labels along tracked branches ────────────────────────
-print("Propagating sweet-spot labels along tracked eigenbranches...")
-level_labels_flux = [{k: sweet_labels.get(k, (-1, -1, -1)) for k in range(N_LEVELS)} for _ in range(N_FLUX)]
+# ── Attach one label to each tracked branch ───────────────────────────────────
+print("Attaching sweet-spot labels to tracked branches...")
+tracked_branch_labels = {k: sweet_labels.get(k, (-1, -1, -1)) for k in range(N_LEVELS)}
 
 # ── Extract chi and alpha vs flux ─────────────────────────────────────────────
 alpha_q_vals = np.full(N_FLUX, np.nan)
@@ -542,8 +542,11 @@ alpha_r_vals = np.full(N_FLUX, np.nan)
 chi_qr_vals  = np.full(N_FLUX, np.nan)
 
 for i in range(N_FLUX):
-    labels = level_labels_flux[i]
-    qn_to_E = {(nq, na, nr): all_evals[i, k] for k, (nq, na, nr) in labels.items()}
+    qn_to_E = {
+        label: all_evals[i, k]
+        for k, label in tracked_branch_labels.items()
+        if label != (-1, -1, -1)
+    }
 
     E_000 = qn_to_E.get((0, 0, 0))
     E_100 = qn_to_E.get((1, 0, 0))
@@ -576,6 +579,16 @@ for name, arr in [
     s = f"{v:.2f}" if not np.isnan(v) else "N/A"
     print(f"  {name} / 2pi = {s} MHz")
 
+def _finite_bounds(arrays, pad_frac=0.08, min_span=1.0):
+    finite = np.concatenate([np.asarray(a, dtype=float)[np.isfinite(a)] for a in arrays])
+    if finite.size == 0:
+        return -0.5, 0.5
+    vmin = float(np.min(finite))
+    vmax = float(np.max(finite))
+    span = max(vmax - vmin, min_span)
+    pad = pad_frac * span
+    return vmin - pad, vmax + pad
+
 # ── Plot ──────────────────────────────────────────────────────────────────────
 fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
 
@@ -586,6 +599,8 @@ ax1.axhline(0, color="gray", linewidth=0.5, linestyle="--")
 ax1.axvline(0, color="gray", linewidth=0.5, linestyle="--", alpha=0.5)
 ax1.legend(fontsize=11)
 ax1.grid(True, alpha=0.25)
+ax1.set_xlim(float(phi_vals[0]), float(phi_vals[-1]))
+ax1.set_ylim(*_finite_bounds([chi_qr_mhz], pad_frac=0.10, min_span=0.2))
 
 ax2.plot(phi_vals, alpha_q_mhz, color="C1", linewidth=1.6, label=r"$\alpha_q$")
 ax2.plot(phi_vals, alpha_r_mhz, color="C4", linewidth=1.6, label=r"$\alpha_r$")
@@ -596,6 +611,8 @@ ax2.axhline(0, color="gray", linewidth=0.5, linestyle="--")
 ax2.axvline(0, color="gray", linewidth=0.5, linestyle="--", alpha=0.5)
 ax2.legend(fontsize=11)
 ax2.grid(True, alpha=0.25)
+ax2.set_xlim(float(phi_vals[0]), float(phi_vals[-1]))
+ax2.set_ylim(*_finite_bounds([alpha_q_mhz, alpha_r_mhz], pad_frac=0.10, min_span=0.2))
 
 fig.tight_layout()
 

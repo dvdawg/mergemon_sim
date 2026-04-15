@@ -425,6 +425,7 @@ H = 6.62607015e-34
 MAX_OVERLAY_GAP_GHZ = 0.1
 DERIVATIVE_JUMP_WARN_THRESHOLD = 2.0
 LABEL_VALID_PHI_MAX = 0.45
+LABEL_VALID_PHI_TOL = 1e-12
 CHI_WARN_ABS_GHZ = 0.1
 CHI_DISPLAY_ABS_MAX_GHZ = 0.1
 
@@ -725,7 +726,23 @@ def sweet_spot_branch_labels_and_indices(
                 f"E_mid={evals_mid[idx]:.9g} GHz"
             )
 
-    labels = _labels_from_indices(tracked_evals.shape[1], label_indices)
+    display_label_indices = {}
+    try:
+        display_label_indices = _analytic_sweet_spot_candidate(evals_mid, omega_r_hint)
+    except Exception:
+        display_label_indices = {}
+
+    labels = _labels_from_indices(tracked_evals.shape[1], display_label_indices)
+    for label, idx in label_indices.items():
+        if 0 <= idx < len(labels):
+            labels = [None if existing == label else existing for existing in labels]
+            labels[idx] = label
+
+    labeled_count = sum(label is not None for label in labels)
+    print(
+        f"{prefix} display labels assigned to "
+        f"{labeled_count}/{len(labels)} tracked branches"
+    )
     return labels, label_indices
 
 
@@ -753,6 +770,43 @@ def branch_followed_observables(tracked_evals, label_indices):
         e10 = tracked_evals[:, idx_10]
         e01 = tracked_evals[:, idx_01]
         e11 = tracked_evals[:, idx_11]
+        chi_col = e11 - e10 - e01 + e00
+
+    return alpha_col, chi_col
+
+
+def labeled_tracked_energy_table(tracked_evals, label_indices):
+    state_order = ((0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (0, 2))
+    state_energies = np.full((len(state_order), tracked_evals.shape[0]), np.nan)
+    state_branch_indices = {}
+
+    for row_idx, label in enumerate(state_order):
+        branch_idx = label_indices.get(label)
+        if branch_idx is None:
+            continue
+        state_branch_indices[label] = int(branch_idx)
+        state_energies[row_idx] = tracked_evals[:, branch_idx]
+
+    return state_order, state_energies, state_branch_indices
+
+
+def observables_from_labeled_tracked_energies(state_order, state_energies):
+    row_for_label = {label: idx for idx, label in enumerate(state_order)}
+    n_flux = state_energies.shape[1]
+    alpha_col = np.full(n_flux, np.nan)
+    chi_col = np.full(n_flux, np.nan)
+
+    if all(label in row_for_label for label in ((0, 0), (1, 0), (2, 0))):
+        e00 = state_energies[row_for_label[(0, 0)]]
+        e10 = state_energies[row_for_label[(1, 0)]]
+        e20 = state_energies[row_for_label[(2, 0)]]
+        alpha_col = e20 - 2.0 * e10 + e00
+
+    if all(label in row_for_label for label in ((0, 0), (1, 0), (0, 1), (1, 1))):
+        e00 = state_energies[row_for_label[(0, 0)]]
+        e10 = state_energies[row_for_label[(1, 0)]]
+        e01 = state_energies[row_for_label[(0, 1)]]
+        e11 = state_energies[row_for_label[(1, 1)]]
         chi_col = e11 - e10 - e01 + e00
 
     return alpha_col, chi_col
@@ -904,12 +958,16 @@ def sweep_beta_column(
         label_indices = {}
 
     for idx, phi_ext in enumerate(phi_vals):
-        if abs(phi_ext) <= LABEL_VALID_PHI_MAX:
+        if abs(phi_ext) <= LABEL_VALID_PHI_MAX + LABEL_VALID_PHI_TOL:
             tracked_labels[idx] = list(branch_labels)
 
-    alpha_col, chi_col = branch_followed_observables(
+    state_order, state_energies, state_branch_indices = labeled_tracked_energy_table(
         tracked_evals,
         label_indices,
+    )
+    alpha_col, chi_col = observables_from_labeled_tracked_energies(
+        state_order,
+        state_energies,
     )
     missing_labels = [
         format_label(label)
@@ -921,11 +979,18 @@ def sweep_beta_column(
             f"{prefix} branch-followed observables missing labels: "
             f"{', '.join(missing_labels)}"
         )
+    print(f"{prefix} labeled tracked-energy rows used for heatmap observables:")
+    for label in state_order:
+        branch_idx = state_branch_indices.get(label)
+        if branch_idx is None:
+            print(f"{prefix}   {format_label(label)} -> missing")
+        else:
+            print(f"{prefix}   {format_label(label)} -> branch {branch_idx}")
     finite_chi = chi_col[np.isfinite(chi_col)]
     if finite_chi.size:
         warn_count = int(np.sum(np.abs(finite_chi) > CHI_WARN_ABS_GHZ))
         print(
-            f"{prefix} branch-followed chi range: "
+            f"{prefix} tracked-energy heatmap chi range: "
             f"{np.nanmin(finite_chi) * 1e3:.6g} to "
             f"{np.nanmax(finite_chi) * 1e3:.6g} MHz; "
             f"chi(phi=0)={chi_col[mid_idx] * 1e3:.6g} MHz; "
@@ -940,13 +1005,15 @@ def sweep_beta_column(
                 f"{prefix}   chi(phi={phi_vals[sample_idx]:+.3f}) = {value_text}"
             )
     else:
-        print(f"{prefix} branch-followed chi is all NaN")
+        print(f"{prefix} tracked-energy heatmap chi is all NaN")
 
     return {
         "alpha": alpha_col,
         "chi": chi_col,
         "tracked_evals": tracked_evals,
         "tracked_labels": tracked_labels,
+        "state_order": state_order,
+        "state_energies": state_energies,
     }
 
 
@@ -956,14 +1023,20 @@ def format_label(label):
     return f"|{label[0]},{label[1]}>"
 
 
+def state_column_name(label):
+    return f"state_{label[0]}_{label[1]}_GHz"
+
+
 def write_sweep_csv(path, phi_vals, column_results):
     max_levels = max(
         (result["tracked_evals"].shape[1] for result in column_results if result is not None),
         default=0,
     )
+    state_order = ((0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (0, 2))
     with open(path, "w", newline="") as csvfile:
         writer = csv.writer(csvfile)
         header = ["beta", "phi_ext_over_phi0", "alpha_GHz", "chi_GHz", "abs_chi_GHz"]
+        header.extend(state_column_name(label) for label in state_order)
         header.extend(f"tracked_level_{level_idx}_GHz" for level_idx in range(max_levels))
         header.extend(f"tracked_level_{level_idx}_label" for level_idx in range(max_levels))
         writer.writerow(header)
@@ -974,6 +1047,7 @@ def write_sweep_csv(path, phi_vals, column_results):
             beta = result["beta"]
             tracked_evals = result["tracked_evals"]
             tracked_labels = result["tracked_labels"]
+            state_energies = result.get("state_energies")
             alpha_col = result["alpha"]
             chi_col = result["chi"]
             for flux_idx, phi in enumerate(phi_vals):
@@ -984,6 +1058,13 @@ def write_sweep_csv(path, phi_vals, column_results):
                     chi_col[flux_idx],
                     abs(chi_col[flux_idx]) if np.isfinite(chi_col[flux_idx]) else np.nan,
                 ]
+                if state_energies is None:
+                    row.extend(np.nan for _ in state_order)
+                else:
+                    row.extend(
+                        state_energies[state_idx, flux_idx]
+                        for state_idx in range(len(state_order))
+                    )
                 row.extend(tracked_evals[flux_idx, level_idx] for level_idx in range(tracked_evals.shape[1]))
                 row.extend("" for _ in range(max_levels - tracked_evals.shape[1]))
                 for level_idx in range(tracked_evals.shape[1]):
@@ -1140,6 +1221,10 @@ def main():
     print(
         f"Tracked-level labels are anchored at the sweet spot and only written "
         f"for |Phi| <= {LABEL_VALID_PHI_MAX:.2f} Phi0."
+    )
+    print(
+        "Heatmap alpha/chi values are computed from the labeled tracked-energy "
+        "rows built after each flux sweep."
     )
     for i, L_c in enumerate(L_c_vals):
         beta = L_c / L_tot

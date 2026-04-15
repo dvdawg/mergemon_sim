@@ -13,9 +13,9 @@ TITLE_FONTSIZE = 14
 LEGEND_FONTSIZE = 10
 SUPTITLE_FONTSIZE = 18
 
-L_r = 0.60e-9
-C_r = 0.80e-12
-L_c = 0.15e-9
+L_r = 0.264e-9
+C_r = 0.878e-12
+L_c = 0.396e-9
 L_J1 = 30.0e-9
 L_J2 = 30.0e-9
 C_J1 = 40e-15
@@ -30,6 +30,10 @@ NR_MAX = 6
 N_LEVELS = 12
 N_FLUX = 101
 DERIVATIVE_JUMP_WARN_THRESHOLD = 2.0
+DERIVATIVE_REPAIR_MIN_IMPROVEMENT = 0.25
+DERIVATIVE_REPAIR_MAX_PASSES = 50
+DERIVATIVE_REPAIR_WINDOW_PHI = 0.05
+FORCE_BEST_DERIVATIVE_REPAIR_SWAP = True
 LABEL_VALID_PHI_MAX = 0.45
 
 
@@ -157,11 +161,16 @@ def _match_branches_step(
     curr_evecs,
     delta_phi,
     prev_prev_evals=None,
+    next_evals=None,
+    next_delta_phi=None,
     overlap_weight=4.0,
     energy_weight=0.7,
-    derivative_weight=1.6,
+    derivative_weight=2.5,
+    derivative_lookahead_weight=2.5,
     energy_scale=0.05,
-    derivative_scale=2.0,
+    derivative_scale=0.5,
+    derivative_hard_threshold=DERIVATIVE_JUMP_WARN_THRESHOLD,
+    derivative_hard_penalty=1.0e6,
 ):
     overlap = np.abs(curr_evecs.conj().T @ prev_evecs) ** 2
     cost = overlap_weight * (1.0 - overlap)
@@ -171,13 +180,203 @@ def _match_branches_step(
     if prev_prev_evals is not None:
         prev_slope = (prev_evals - prev_prev_evals) / delta_phi
         curr_slope = (curr_evals[:, None] - prev_evals[None, :]) / delta_phi
-        derivative_jump_cost = np.abs(curr_slope - prev_slope[None, :]) / derivative_scale
+        abs_derivative_jump = np.abs(curr_slope - prev_slope[None, :])
+        derivative_jump_cost = (abs_derivative_jump / derivative_scale) ** 2
         cost += derivative_weight * derivative_jump_cost
+        cost += np.where(
+            abs_derivative_jump >= derivative_hard_threshold,
+            derivative_hard_penalty
+            * (abs_derivative_jump / derivative_hard_threshold) ** 2,
+            0.0,
+        )
+
+    if next_evals is not None and next_delta_phi is not None:
+        curr_slope = (curr_evals[:, None] - prev_evals[None, :]) / delta_phi
+        next_slope = (
+            next_evals[:, None, None] - curr_evals[None, :, None]
+        ) / next_delta_phi
+        best_next_jump = np.min(np.abs(next_slope - curr_slope[None, :, :]), axis=0)
+        lookahead_cost = (best_next_jump / derivative_scale) ** 2
+        cost += derivative_lookahead_weight * lookahead_cost
+        cost += np.where(
+            best_next_jump >= derivative_hard_threshold,
+            derivative_hard_penalty
+            * (best_next_jump / derivative_hard_threshold) ** 2,
+            0.0,
+        )
 
     row_ind, col_ind = linear_sum_assignment(cost)
     perm = np.empty_like(col_ind)
     perm[col_ind] = row_ind
     return perm
+
+
+def _derivative_jump_metrics(
+    evals,
+    phi_vals,
+    valid_phi_max=LABEL_VALID_PHI_MAX,
+    threshold=DERIVATIVE_JUMP_WARN_THRESHOLD,
+):
+    slopes = np.diff(evals, axis=0) / np.diff(phi_vals)[:, None]
+    jumps = np.abs(np.diff(slopes, axis=0))
+    jump_centers = phi_vals[1:-1]
+    valid = np.abs(jump_centers) <= valid_phi_max
+    valid_jumps = jumps[valid]
+    if valid_jumps.size == 0:
+        return {"score": 0.0, "count": 0, "max": 0.0}
+
+    excess = np.maximum(valid_jumps - threshold, 0.0)
+    return {
+        "score": float(np.sum(excess**2)),
+        "count": int(np.count_nonzero(excess > 0.0)),
+        "max": float(np.max(valid_jumps)),
+    }
+
+
+def _local_derivative_jump_metrics(
+    evals,
+    phi_vals,
+    branches,
+    centers,
+    window_phi=DERIVATIVE_REPAIR_WINDOW_PHI,
+    threshold=DERIVATIVE_JUMP_WARN_THRESHOLD,
+):
+    slopes = np.diff(evals[:, branches], axis=0) / np.diff(phi_vals)[:, None]
+    jumps = np.abs(np.diff(slopes, axis=0))
+    jump_centers = phi_vals[1:-1]
+    local = np.zeros_like(jump_centers, dtype=bool)
+    for center in centers:
+        local |= np.abs(jump_centers - center) <= window_phi
+
+    local_jumps = jumps[local]
+    if local_jumps.size == 0:
+        return {"score": 0.0, "count": 0, "max": 0.0}
+
+    excess = np.maximum(local_jumps - threshold, 0.0)
+    return {
+        "score": float(np.sum(excess**2)),
+        "count": int(np.count_nonzero(excess > 0.0)),
+        "max": float(np.max(local_jumps)),
+    }
+
+
+def _symmetric_interval_for_phi(phi_vals, phi_abs):
+    lo = int(np.argmin(np.abs(phi_vals + phi_abs)))
+    hi = int(np.argmin(np.abs(phi_vals - phi_abs)))
+    if lo > hi:
+        lo, hi = hi, lo
+    return lo, hi
+
+
+def _swap_branch_interval(evals, lo, hi, a, b):
+    swapped = np.array(evals, copy=True)
+    a_values = np.array(swapped[lo : hi + 1, a], copy=True)
+    b_values = np.array(swapped[lo : hi + 1, b], copy=True)
+    swapped[lo : hi + 1, a] = b_values
+    swapped[lo : hi + 1, b] = a_values
+    return swapped
+
+
+def repair_derivative_swaps(
+    tracked_evals,
+    tracked_evecs,
+    phi_vals,
+    start_idx,
+    valid_phi_max=LABEL_VALID_PHI_MAX,
+    min_improvement=DERIVATIVE_REPAIR_MIN_IMPROVEMENT,
+    max_passes=DERIVATIVE_REPAIR_MAX_PASSES,
+):
+    repaired_evals = np.array(tracked_evals, copy=True)
+    repaired_evecs = [np.array(evec, copy=True) for evec in tracked_evecs]
+    n_flux, n_levels = repaired_evals.shape
+    slopes = np.diff(repaired_evals, axis=0) / np.diff(phi_vals)[:, None]
+    jumps = np.abs(np.diff(slopes, axis=0))
+    jump_candidates = np.argwhere(jumps >= DERIVATIVE_JUMP_WARN_THRESHOLD)
+    jump_candidates = sorted(
+        jump_candidates,
+        key=lambda item: jumps[item[0], item[1]],
+        reverse=True,
+    )
+
+    chosen = None
+    for jump_idx, a in jump_candidates:
+        jump_center_idx = int(jump_idx + 1)
+        phi = float(phi_vals[jump_center_idx])
+        if not (-valid_phi_max <= phi < 0.0):
+            continue
+
+        energies_at_jump = repaired_evals[jump_center_idx]
+        gaps = np.abs(energies_at_jump - energies_at_jump[int(a)])
+        gaps[0] = np.inf
+        gaps[int(a)] = np.inf
+        b = int(np.argmin(gaps))
+        phi_abs = abs(phi)
+        lo, hi = _symmetric_interval_for_phi(phi_vals, phi_abs)
+        if lo == 0 or hi == n_flux - 1:
+            continue
+
+        chosen = {
+            "jump_idx": int(jump_idx),
+            "jump_center_idx": jump_center_idx,
+            "jump": float(jumps[jump_idx, a]),
+            "a": int(a),
+            "b": b,
+            "lo": lo,
+            "hi": hi,
+            "gap": float(gaps[b]),
+        }
+        break
+
+    if chosen is None:
+        print(
+            "Derivative swap repair: no negative-flux derivative jumps above "
+            f"{DERIVATIVE_JUMP_WARN_THRESHOLD:.3g} GHz/Phi0 found inside "
+            f"|Phi| <= {valid_phi_max:.3g}."
+        )
+        return repaired_evals, repaired_evecs
+
+    a = chosen["a"]
+    b = chosen["b"]
+    lo = chosen["lo"]
+    hi = chosen["hi"]
+    probe_indices = sorted({lo, chosen["jump_center_idx"], start_idx, hi})
+    before_probe = [
+        (float(phi_vals[idx]), float(repaired_evals[idx, a]), float(repaired_evals[idx, b]))
+        for idx in probe_indices
+    ]
+
+    repaired_evals = _swap_branch_interval(repaired_evals, lo, hi, a, b)
+    for flux_idx in range(lo, hi + 1):
+        a_vec = np.array(repaired_evecs[flux_idx][:, a], copy=True)
+        b_vec = np.array(repaired_evecs[flux_idx][:, b], copy=True)
+        repaired_evecs[flux_idx][:, a] = b_vec
+        repaired_evecs[flux_idx][:, b] = a_vec
+
+    after_probe = [
+        (float(phi_vals[idx]), float(repaired_evals[idx, a]), float(repaired_evals[idx, b]))
+        for idx in probe_indices
+    ]
+
+    print("Derivative swap repair: force-applied closest-energy symmetric swap.")
+    print(
+        "  "
+        f"jump phi={phi_vals[chosen['jump_center_idx']]:+.4f}, "
+        f"|Delta slope|={chosen['jump']:.3g} GHz/Phi0, "
+        f"branches {a}<->{b}, closest gap={chosen['gap']:.3g} GHz"
+    )
+    print(
+        "  "
+        f"swapped interval [{phi_vals[lo]:+.4f}, {phi_vals[hi]:+.4f}] "
+        f"({hi - lo + 1} flux points)"
+    )
+    print("  probe before swap:")
+    for phi, ea, eb in before_probe:
+        print(f"    phi={phi:+.4f}: branch {a}={ea:.6g}, branch {b}={eb:.6g}")
+    print("  probe after swap:")
+    for phi, ea, eb in after_probe:
+        print(f"    phi={phi:+.4f}: branch {a}={ea:.6g}, branch {b}={eb:.6g}")
+
+    return repaired_evals, repaired_evecs
 
 
 def track_eigenbranches(raw_evals, all_evecs, phi_vals, start_idx):
@@ -191,6 +390,10 @@ def track_eigenbranches(raw_evals, all_evecs, phi_vals, start_idx):
     for i in range(start_idx + 1, n_flux):
         prev_prev_evals = tracked_evals[i - 2] if i - 2 >= start_idx else None
         delta_phi = float(phi_vals[i] - phi_vals[i - 1])
+        next_evals = raw_evals[i + 1] if i + 1 < n_flux else None
+        next_delta_phi = (
+            float(phi_vals[i + 1] - phi_vals[i]) if i + 1 < n_flux else None
+        )
         perm = _match_branches_step(
             tracked_evals[i - 1],
             raw_evals[i],
@@ -198,6 +401,8 @@ def track_eigenbranches(raw_evals, all_evecs, phi_vals, start_idx):
             all_evecs[i],
             delta_phi,
             prev_prev_evals=prev_prev_evals,
+            next_evals=next_evals,
+            next_delta_phi=next_delta_phi,
         )
         tracked_evals[i] = raw_evals[i][perm]
         tracked_evecs[i] = all_evecs[i][:, perm]
@@ -205,6 +410,10 @@ def track_eigenbranches(raw_evals, all_evecs, phi_vals, start_idx):
     for i in range(start_idx - 1, -1, -1):
         prev_prev_evals = tracked_evals[i + 2] if i + 2 <= start_idx else None
         delta_phi = float(phi_vals[i] - phi_vals[i + 1])
+        next_evals = raw_evals[i - 1] if i - 1 >= 0 else None
+        next_delta_phi = (
+            float(phi_vals[i - 1] - phi_vals[i]) if i - 1 >= 0 else None
+        )
         perm = _match_branches_step(
             tracked_evals[i + 1],
             raw_evals[i],
@@ -212,11 +421,13 @@ def track_eigenbranches(raw_evals, all_evecs, phi_vals, start_idx):
             all_evecs[i],
             delta_phi,
             prev_prev_evals=prev_prev_evals,
+            next_evals=next_evals,
+            next_delta_phi=next_delta_phi,
         )
         tracked_evals[i] = raw_evals[i][perm]
         tracked_evecs[i] = all_evecs[i][:, perm]
 
-    return tracked_evals, tracked_evecs
+    return repair_derivative_swaps(tracked_evals, tracked_evecs, phi_vals, start_idx)
 
 
 def report_derivative_jumps(

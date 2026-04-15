@@ -485,7 +485,9 @@ for a in flux_attrs:
         setattr(circ, a, 0.0)
 
 # ── Flux sweep ────────────────────────────────────────────────────────────────
-N_LEVELS = 16
+# Track more dressed levels so ancilla-excited states like |010>, |110>, and
+# |011> are present in the tracked manifold for chi_qa and chi_ar extraction.
+N_LEVELS = 40
 N_FLUX   = 101
 phi_vals = np.linspace(-0.5, 0.5, N_FLUX)
 mid_idx  = N_FLUX // 2
@@ -541,6 +543,7 @@ alpha_q_vals = np.full(N_FLUX, np.nan)
 alpha_r_vals = np.full(N_FLUX, np.nan)
 chi_qa_vals  = np.full(N_FLUX, np.nan)
 chi_ar_vals  = np.full(N_FLUX, np.nan)
+chi_qr_vals  = np.full(N_FLUX, np.nan)
 
 for i in range(N_FLUX):
     qn_to_E = {
@@ -572,10 +575,14 @@ for i in range(N_FLUX):
     if all(x is not None for x in [E_000, E_010, E_001, E_011]):
         chi_ar_vals[i] = (E_011 - E_001) - (E_010 - E_000)
 
+    if all(x is not None for x in [E_000, E_100, E_001, E_101]):
+        chi_qr_vals[i] = (E_101 - E_001) - (E_100 - E_000)
+
 alpha_q_mhz = alpha_q_vals * 1e3
 alpha_r_mhz = alpha_r_vals * 1e3
 chi_qa_mhz  = chi_qa_vals  * 1e3
 chi_ar_mhz  = chi_ar_vals  * 1e3
+chi_qr_mhz  = chi_qr_vals  * 1e3
 
 print(f"\n--- Values at sweet spot (Phi = {phi_vals[mid_idx]:.3f} Phi_0) ---")
 for name, arr in [
@@ -583,18 +590,56 @@ for name, arr in [
     ("alpha_r", alpha_r_mhz),
     ("chi_qa",  chi_qa_mhz),
     ("chi_ar",  chi_ar_mhz),
+    ("chi_qr",  chi_qr_mhz),
 ]:
     v = arr[mid_idx]
     s = f"{v:.2f}" if not np.isnan(v) else "N/A"
     print(f"  {name} / 2pi = {s} MHz")
 
-def _finite_bounds(arrays, pad_frac=0.08, min_span=1.0):
-    finite = np.concatenate([np.asarray(a, dtype=float)[np.isfinite(a)] for a in arrays])
-    if finite.size == 0:
-        return -0.5, 0.5
+def _finite_bounds(arrays, pad_frac=0.10):
+    """Y-limits that include all finite samples across the given arrays (typ. MHz)."""
+    chunks = []
+    for a in arrays:
+        a = np.asarray(a, dtype=float)
+        m = np.isfinite(a)
+        if np.any(m):
+            chunks.append(a[m])
+    if not chunks:
+        return None
+    finite = np.concatenate(chunks)
     vmin = float(np.min(finite))
     vmax = float(np.max(finite))
-    span = max(vmax - vmin, min_span)
+    span = vmax - vmin
+    if span <= 0:
+        eps = max(abs(vmin) * 1e-3 if vmin != 0 else 1.0, 1e-6)
+        vmin -= eps
+        vmax += eps
+        span = vmax - vmin
+    pad = pad_frac * span
+    return vmin - pad, vmax + pad
+
+
+def _robust_finite_bounds(arrays, lower_pct=5.0, upper_pct=95.0, pad_frac=0.15):
+    """Y-limits based on central percentiles so a few outliers do not hide the curves."""
+    chunks = []
+    for a in arrays:
+        a = np.asarray(a, dtype=float)
+        m = np.isfinite(a)
+        if np.any(m):
+            chunks.append(a[m])
+    if not chunks:
+        return None
+
+    finite = np.concatenate(chunks)
+    if finite.size < 6:
+        return _finite_bounds([finite], pad_frac=pad_frac)
+
+    vmin = float(np.percentile(finite, lower_pct))
+    vmax = float(np.percentile(finite, upper_pct))
+    span = vmax - vmin
+    if span <= 0 or not np.isfinite(span):
+        return _finite_bounds([finite], pad_frac=pad_frac)
+
     pad = pad_frac * span
     return vmin - pad, vmax + pad
 
@@ -610,7 +655,11 @@ ax1.axvline(0, color="gray", linewidth=0.5, linestyle="--", alpha=0.5)
 ax1.legend(fontsize=11)
 ax1.grid(True, alpha=0.25)
 ax1.set_xlim(float(phi_vals[0]), float(phi_vals[-1]))
-ax1.set_ylim(*_finite_bounds([chi_qa_mhz, chi_ar_mhz], pad_frac=0.10, min_span=0.2))
+chi_ylim = _robust_finite_bounds([chi_qa_mhz, chi_ar_mhz])
+if chi_ylim is not None:
+    ax1.set_ylim(*chi_ylim)
+else:
+    ax1.autoscale(axis="y")
 
 ax2.plot(phi_vals, alpha_q_mhz, color="C1", linewidth=1.6, label=r"$\alpha_q$")
 ax2.plot(phi_vals, alpha_r_mhz, color="C4", linewidth=1.6, label=r"$\alpha_r$")
@@ -622,7 +671,11 @@ ax2.axvline(0, color="gray", linewidth=0.5, linestyle="--", alpha=0.5)
 ax2.legend(fontsize=11)
 ax2.grid(True, alpha=0.25)
 ax2.set_xlim(float(phi_vals[0]), float(phi_vals[-1]))
-ax2.set_ylim(*_finite_bounds([alpha_q_mhz, alpha_r_mhz], pad_frac=0.10, min_span=0.2))
+alpha_ylim = _finite_bounds([alpha_q_mhz, alpha_r_mhz])
+if alpha_ylim is not None:
+    ax2.set_ylim(*alpha_ylim)
+else:
+    ax2.autoscale(axis="y")
 
 fig.tight_layout()
 

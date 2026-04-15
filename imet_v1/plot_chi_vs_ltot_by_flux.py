@@ -1,4 +1,3 @@
-import argparse
 import csv
 from pathlib import Path
 
@@ -6,72 +5,19 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-DEFAULT_FLUXES = [-0.5, -0.25, 0.0, 0.25, 0.5]
+DEFAULT_FLUXES = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
 DEFAULT_RESULTS_DIR = Path(__file__).resolve().parent / "sweep_results"
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "plot_output"
 CSV_GLOB = "imet_alpha_chi_vs_beta_flux*.csv"
+RESULTS_DIR = DEFAULT_RESULTS_DIR
+OUTPUT_DIR = DEFAULT_OUTPUT_DIR
+FLUX_VALUES = DEFAULT_FLUXES
+EXCLUDED_FOLDERS = ["Ltot_075"]
+SHOW_PLOT = False
 
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description=(
-            "Plot chi versus total inductance Ltot using the sweep CSVs in "
-            "imet_v1/sweep_results. Because each folder contains a beta/flux "
-            "heatmap, the script collapses the beta axis either by selecting "
-            "the beta with the largest |chi| at each flux or by taking a fixed "
-            "beta slice."
-        )
-    )
-    parser.add_argument(
-        "--results-dir",
-        type=Path,
-        default=DEFAULT_RESULTS_DIR,
-        help="Directory containing Ltot_* sweep folders.",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=DEFAULT_OUTPUT_DIR,
-        help="Directory where the plot and summary CSV will be saved.",
-    )
-    parser.add_argument(
-        "--flux-values",
-        type=float,
-        nargs="+",
-        default=DEFAULT_FLUXES,
-        help=(
-            "Flux biases to plot in units of Phi_ext/Phi_0. The nearest sampled "
-            "flux point in each CSV is used."
-        ),
-    )
-    parser.add_argument(
-        "--beta-mode",
-        choices=("max-abs-chi", "fixed"),
-        default="max-abs-chi",
-        help=(
-            "How to collapse the beta dimension inside each Ltot folder. "
-            "'max-abs-chi' picks the beta with the largest |chi| for each flux. "
-            "'fixed' uses the nearest available beta to --beta-value."
-        ),
-    )
-    parser.add_argument(
-        "--beta-value",
-        type=float,
-        default=0.5,
-        help="Beta value used when --beta-mode=fixed.",
-    )
-    parser.add_argument(
-        "--exclude-folder",
-        action="append",
-        default=["Ltot_075"],
-        help="Folder name to ignore. May be passed multiple times.",
-    )
-    parser.add_argument(
-        "--show",
-        action="store_true",
-        help="Display the plot window after saving.",
-    )
-    return parser.parse_args()
+# Choose "fixed" for a beta slice or "max-abs-chi" for the envelope over beta.
+BETA_MODE = "fixed"
+BETA_VALUE = 0.1
 
 
 def parse_ltot_nh(folder_name):
@@ -130,15 +76,23 @@ def select_row_for_flux(rows, target_flux, beta_mode, beta_value):
     if not flux_rows:
         raise ValueError(f"No rows found for flux {phi_used}")
 
+    finite_flux_rows = [
+        row for row in flux_rows if np.isfinite(row["chi_mhz"])
+    ]
+    if not finite_flux_rows:
+        raise ValueError(f"No finite chi values found for flux {phi_used}")
+
     if beta_mode == "max-abs-chi":
-        selected = max(flux_rows, key=lambda row: abs(row["chi_mhz"]))
+        selected = max(finite_flux_rows, key=lambda row: abs(row["chi_mhz"]))
     else:
-        beta_values = unique_sorted(row["beta"] for row in flux_rows)
+        beta_values = unique_sorted(row["beta"] for row in finite_flux_rows)
         beta_used, _ = nearest_value(beta_values, beta_value)
-        flux_rows = [row for row in flux_rows if np.isclose(row["beta"], beta_used)]
-        if not flux_rows:
+        beta_rows = [
+            row for row in finite_flux_rows if np.isclose(row["beta"], beta_used)
+        ]
+        if not beta_rows:
             raise ValueError(f"No rows found for beta {beta_used}")
-        selected = flux_rows[0]
+        selected = beta_rows[0]
 
     return {
         "flux_requested": float(target_flux),
@@ -251,23 +205,22 @@ def make_plot(dataset, beta_mode, beta_value, output_path):
 
 
 def main():
-    args = parse_args()
     dataset = collect_dataset(
-        results_dir=args.results_dir,
-        excluded_folders=args.exclude_folder,
-        flux_values=args.flux_values,
-        beta_mode=args.beta_mode,
-        beta_value=args.beta_value,
+        results_dir=RESULTS_DIR,
+        excluded_folders=EXCLUDED_FOLDERS,
+        flux_values=FLUX_VALUES,
+        beta_mode=BETA_MODE,
+        beta_value=BETA_VALUE,
     )
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    plot_path = args.output_dir / "chi_vs_ltot_by_flux.png"
-    summary_path = args.output_dir / "chi_vs_ltot_by_flux_summary.csv"
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    plot_path = OUTPUT_DIR / "chi_vs_ltot_by_flux.png"
+    summary_path = OUTPUT_DIR / "chi_vs_ltot_by_flux_summary.csv"
 
     fig = make_plot(
         dataset=dataset,
-        beta_mode=args.beta_mode,
-        beta_value=args.beta_value,
+        beta_mode=BETA_MODE,
+        beta_value=BETA_VALUE,
         output_path=plot_path,
     )
     write_summary_csv(dataset, summary_path)
@@ -275,7 +228,7 @@ def main():
     print(f"Saved {plot_path}")
     print(f"Saved {summary_path}")
 
-    if args.show:
+    if SHOW_PLOT:
         plt.show()
     else:
         plt.close(fig)

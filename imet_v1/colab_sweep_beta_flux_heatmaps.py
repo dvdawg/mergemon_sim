@@ -64,40 +64,217 @@ def _identify_omega_r_from_hint(E, omega_r_hint):
     return float(E[k]), k
 
 
+def _identify_omega_from_hint(E, omega_hint):
+    E = np.asarray(E)
+    k = int(np.argmin(np.abs(E - omega_hint)))
+    return float(E[k]), k
+
+
+def _match_nearest_unused_level(E, target, used_indices=None):
+    E = np.asarray(E)
+    if used_indices is None:
+        used_indices = set()
+    order = np.argsort(np.abs(E - target))
+    for idx in order:
+        idx = int(idx)
+        if idx not in used_indices:
+            return idx
+    raise ValueError("No unused energy levels available for matching.")
+
+
+def _nearest_level(E, target):
+    idx = int(np.argmin(np.abs(E - target)))
+    return idx, float(E[idx])
+
+
+def _fit_low_level_pair_params(
+    E,
+    omega_q_hint=None,
+    omega_r_hint=None,
+    max_candidate_index=5,
+):
+    E = np.asarray(E, dtype=float)
+    max_idx = min(len(E) - 1, max_candidate_index)
+    if max_idx < 2:
+        raise ValueError("Need at least two excited levels for low-level pair fit.")
+
+    best = None
+    for iq in range(1, max_idx + 1):
+        for ir in range(1, max_idx + 1):
+            if iq == ir:
+                continue
+
+            omega_q = float(E[iq])
+            omega_r = float(E[ir])
+            idx_20, E20 = _nearest_level(E, 2.0 * omega_q)
+            idx_02, E02 = _nearest_level(E, 2.0 * omega_r)
+            idx_11, E11 = _nearest_level(E, omega_q + omega_r)
+
+            alpha_q = float(E20 - 2.0 * omega_q)
+            alpha_r = float(E02 - 2.0 * omega_r)
+            chi_qr = float(E11 - (omega_q + omega_r))
+            resid_20 = abs(alpha_q)
+            resid_02 = abs(alpha_r)
+            resid_11 = abs(chi_qr)
+
+            q_hint_miss = (
+                abs(omega_q - float(omega_q_hint))
+                if omega_q_hint is not None
+                else 0.0
+            )
+            r_hint_miss = (
+                abs(omega_r - float(omega_r_hint))
+                if omega_r_hint is not None
+                else 0.0
+            )
+
+            resonator_visible = 2.0 * omega_r <= float(E[-1]) + 0.25
+            q_hint_tol = 1.25
+            r_hint_tol = (
+                max(0.6, 0.12 * float(omega_r_hint))
+                if omega_r_hint is not None
+                else np.inf
+            )
+            valid = (
+                alpha_q < -0.02
+                and abs(alpha_q) < 0.6
+                and resid_20 < 0.35
+                and resid_11 < 0.25
+                and idx_20 not in {0, iq, ir}
+                and idx_11 not in {0, iq, ir, idx_20}
+            )
+            if omega_q_hint is not None:
+                valid = valid and q_hint_miss < q_hint_tol
+            if omega_r_hint is not None:
+                valid = valid and r_hint_miss < r_hint_tol
+            if resonator_visible:
+                valid = (
+                    valid
+                    and idx_02 not in {0, iq, ir, idx_20, idx_11}
+                    and resid_02 < 0.12
+                )
+            if not valid:
+                continue
+
+            # Prefer a transmon-like qubit mode (negative anharmonicity),
+            # a resonator-like mode (near-harmonic), and a small dispersive shift.
+            score = 18.0 * resid_02 + 8.0 * resid_11 + 3.0 * resid_20
+
+            if omega_q_hint is not None:
+                score += 2.0 * q_hint_miss
+            if omega_r_hint is not None:
+                score += 1.5 * r_hint_miss
+
+            if abs(alpha_q) <= abs(alpha_r):
+                score += 30.0
+            if iq > ir:
+                score += 2.0
+            if iq > 2:
+                score += 2.0 * (iq - 2)
+            if ir > 3:
+                score += 1.0 * (ir - 3)
+
+            candidate = dict(
+                omega_q=omega_q,
+                omega_r=omega_r,
+                alpha_q=alpha_q,
+                chi_qr=chi_qr,
+                alpha_r=alpha_r,
+                idx_q=iq,
+                idx_r=ir,
+                idx_20=idx_20,
+                idx_02=idx_02,
+                idx_11=idx_11,
+                resid_20=resid_20,
+                resid_02=resid_02,
+                resid_11=resid_11,
+                score=score,
+            )
+            if best is None or candidate["score"] < best["score"]:
+                best = candidate
+
+    if best is None:
+        raise ValueError("Unable to fit low-level qubit/resonator pair.")
+    return best
+
+
 def fit_effective_params_2mode(
-    evals_rel, tol_nonmultiple=0.20, omega_r_known=None, omega_r_hint=None
+    evals_rel,
+    tol_nonmultiple=0.20,
+    omega_r_known=None,
+    omega_r_hint=None,
+    omega_q_hint=None,
 ):
     E = np.array(sorted(evals_rel))
     if E[0] != 0.0:
         E = E - E[0]
 
+    try:
+        params = _fit_low_level_pair_params(
+            E,
+            omega_q_hint=omega_q_hint,
+            omega_r_hint=omega_r_hint,
+        )
+        # FIX: return ALL keys from _fit_low_level_pair_params, not just four.
+        # fit_and_label_tracked_levels needs idx_q, idx_r, idx_20, idx_11, idx_02.
+        return params
+    except Exception:
+        if omega_q_hint is not None or omega_r_hint is not None:
+            raise
+
     if omega_r_known is not None:
         omega_r = float(omega_r_known)
     elif omega_r_hint is not None:
-        omega_r, _ = _identify_omega_r_from_hint(E, float(omega_r_hint))
+        omega_r, _ = _identify_omega_from_hint(E, float(omega_r_hint))
     else:
         omega_r = _peak_spacing_from_pairwise_diffs(
             E[: min(len(E), 16)], min_diff=1.0, bin_width=0.02
         )
 
-    omega_q = None
-    for Ek in E[1:]:
-        resid, _ = _nearest_int_multiple_residual(Ek, omega_r)
-        if resid > tol_nonmultiple:
-            omega_q = float(Ek)
-            break
-    if omega_q is None:
-        omega_q = float(E[2]) if len(E) > 2 else float(E[1])
+    if omega_q_hint is not None:
+        omega_q, _ = _identify_omega_from_hint(E, float(omega_q_hint))
+    else:
+        omega_q = None
+        for Ek in E[1:]:
+            resid, _ = _nearest_int_multiple_residual(Ek, omega_r)
+            if resid > tol_nonmultiple:
+                omega_q = float(Ek)
+                break
+        if omega_q is None:
+            omega_q = float(E[2]) if len(E) > 2 else float(E[1])
+
+    idx_q = int(np.argmin(np.abs(E - omega_q)))
+    idx_r = int(np.argmin(np.abs(E - omega_r)))
 
     target_2q = 2.0 * omega_q
-    idx_2q = int(np.argmin(np.abs(E - target_2q)))
-    alpha_q = float(E[idx_2q] - target_2q)
+    idx_20 = int(np.argmin(np.abs(E - target_2q)))
+    alpha_q = float(E[idx_20] - target_2q)
+
+    target_2r = 2.0 * omega_r
+    idx_02 = int(np.argmin(np.abs(E - target_2r)))
 
     target_11 = omega_q + omega_r
     idx_11 = int(np.argmin(np.abs(E - target_11)))
     chi_qr = float(E[idx_11] - target_11)
 
-    return dict(omega_r=omega_r, omega_q=omega_q, alpha_q=alpha_q, chi_qr=chi_qr)
+    # FIX: return the same key set as _fit_low_level_pair_params so the caller
+    # can access idx_q, idx_r, etc. without KeyError.
+    return dict(
+        omega_r=omega_r,
+        omega_q=omega_q,
+        alpha_q=alpha_q,
+        chi_qr=chi_qr,
+        alpha_r=float(E[idx_02] - target_2r),
+        idx_q=idx_q,
+        idx_r=idx_r,
+        idx_20=idx_20,
+        idx_02=idx_02,
+        idx_11=idx_11,
+        resid_20=abs(alpha_q),
+        resid_02=abs(float(E[idx_02] - target_2r)),
+        resid_11=abs(chi_qr),
+        score=0.0,
+    )
 
 
 def predicted_energy_2mode(nq, nr, p, include_chi=True):
@@ -112,7 +289,7 @@ def predicted_energy_2mode(nq, nr, p, include_chi=True):
     )
 
 
-def assign_labels_2mode(evals_rel, p, nq_max=6, nr_max=10, include_chi=True):
+def assign_labels_2mode(evals_rel, p, nq_max=6, nr_max=8, include_chi=True):
     E = np.array(sorted(evals_rel))
     E = E - E[0]
 
@@ -123,9 +300,43 @@ def assign_labels_2mode(evals_rel, p, nq_max=6, nr_max=10, include_chi=True):
             cand.append((Ep, nq, nr))
     cand.sort(key=lambda t: t[0])
 
+    e_max = float(E[-1])
+    anchor_specs = [(0.0, 0, 0)]
+    for nq in range(1, nq_max + 1):
+        target = (
+            p["omega_q"] * nq
+            + 0.5 * p["alpha_q"] * nq * (nq - 1)
+        )
+        if target <= e_max + 1.0:
+            anchor_specs.append((target, nq, 0))
+    for nr in range(1, nr_max + 1):
+        target = p["omega_r"] * nr
+        if target <= e_max + 1.0:
+            anchor_specs.append((target, 0, nr))
+    anchor_specs.sort(key=lambda t: t[0])
+
     used = set()
+    used_energy_indices = set()
+    anchored_by_index = {}
+    for target, nq, nr in anchor_specs:
+        idx = _match_nearest_unused_level(E, target, used_energy_indices)
+        anchored_by_index[idx] = dict(
+            k=idx,
+            E=E[idx],
+            nq=nq,
+            nr=nr,
+            E_pred=predicted_energy_2mode(nq, nr, p, include_chi=include_chi),
+            resid=abs(E[idx] - target),
+        )
+        used.add((nq, nr))
+        used_energy_indices.add(idx)
+
     out = []
     for k, Ek in enumerate(E):
+        if k in anchored_by_index:
+            out.append(anchored_by_index[k])
+            continue
+
         best = None
         best_score = 1e99
 
@@ -159,10 +370,63 @@ def assign_labels_2mode(evals_rel, p, nq_max=6, nr_max=10, include_chi=True):
 
     return out
 
+
+def energy_of_label(assignments, nq, nr):
+    for assignment in assignments:
+        if assignment["nq"] == nq and assignment["nr"] == nr:
+            return assignment["E"]
+    return None
+
+
+def extract_exact_low_level_observables(assignments):
+    E00 = energy_of_label(assignments, 0, 0)
+    E10 = energy_of_label(assignments, 1, 0)
+    E20 = energy_of_label(assignments, 2, 0)
+    E01 = energy_of_label(assignments, 0, 1)
+    E11 = energy_of_label(assignments, 1, 1)
+
+    alpha_q = np.nan
+    chi_qr = np.nan
+
+    if E00 is not None and E10 is not None and E20 is not None:
+        alpha_q = float((E20 - E10) - (E10 - E00))
+
+    if E00 is not None and E10 is not None and E01 is not None and E11 is not None:
+        chi_qr = float((E11 - E01) - (E10 - E00))
+
+    return alpha_q, chi_qr
+
+
+def omega_q_sweet_hint_ghz() -> float:
+    E_J1_eff = E_J1
+    E_J2_eff = E_J2
+    E_J_sum = E_J1_eff + E_J2_eff
+    E_C_eff = charging_energy_ghz(C_J1 + C_J2)
+    if E_J_sum <= 0.0:
+        return E_C_eff
+    return float(np.sqrt(8.0 * E_J_sum * E_C_eff) - E_C_eff)
+
+
+def transmon_energy_levels_ghz(E_J: float, E_C: float, n_max: int = 6) -> np.ndarray:
+    if E_J <= 0.0:
+        n = np.arange(n_max + 1, dtype=float)
+        return n * E_C
+    n = np.arange(n_max + 1, dtype=float)
+    E_n = (
+        np.sqrt(8.0 * E_J * E_C) * (n + 0.5)
+        - (E_C / 12.0) * (6 * n**2 + 6 * n + 3)
+        - E_J
+    )
+    return E_n - E_n[0]
+
 PHI0 = 2.067833848e-15
 E_CHARGE = 1.602176634e-19
 H = 6.62607015e-34
 MAX_OVERLAY_GAP_GHZ = 0.1
+DERIVATIVE_JUMP_WARN_THRESHOLD = 2.0
+LABEL_VALID_PHI_MAX = 0.45
+CHI_WARN_ABS_GHZ = 0.1
+CHI_DISPLAY_ABS_MAX_GHZ = 0.1
 
 
 def inductive_energy_ghz(L_H: float) -> float:
@@ -214,24 +478,336 @@ def build_circuit(L_c: float):
     return circ, str(flux_syms[0]), L_r
 
 
-def fit_and_label_tracked_levels(evals_rel: np.ndarray, omega_r_hint: float):
-    params = fit_effective_params_2mode(evals_rel, omega_r_hint=omega_r_hint)
-    assignments = assign_labels_2mode(evals_rel, params, include_chi=True)
+def _match_branches_step(
+    prev_evals,
+    curr_evals,
+    prev_evecs,
+    curr_evecs,
+    delta_phi,
+    prev_prev_evals=None,
+    overlap_weight=4.0,
+    energy_weight=0.7,
+    derivative_weight=1.6,
+    energy_scale=0.05,
+    derivative_scale=2.0,
+):
+    overlap = np.abs(curr_evecs.conj().T @ prev_evecs) ** 2
+    cost = overlap_weight * (1.0 - overlap)
+    energy_cost = np.abs(curr_evals[:, None] - prev_evals[None, :]) / energy_scale
+    cost += energy_weight * energy_cost
 
-    unmatched = list(assignments)
-    tracked_labels = []
-    for energy in evals_rel:
-        if not unmatched:
-            tracked_labels.append(None)
+    if prev_prev_evals is not None:
+        prev_slope = (prev_evals - prev_prev_evals) / delta_phi
+        curr_slope = (curr_evals[:, None] - prev_evals[None, :]) / delta_phi
+        derivative_jump_cost = np.abs(curr_slope - prev_slope[None, :]) / derivative_scale
+        cost += derivative_weight * derivative_jump_cost
+
+    row_ind, col_ind = linear_sum_assignment(cost)
+    perm = np.empty_like(col_ind)
+    perm[col_ind] = row_ind
+    return perm
+
+
+def track_eigenbranches(raw_evals, all_evecs, phi_vals, start_idx):
+    n_flux, _ = raw_evals.shape
+    tracked_evals = np.zeros_like(raw_evals)
+    tracked_evecs = [None] * n_flux
+
+    tracked_evals[start_idx] = raw_evals[start_idx]
+    tracked_evecs[start_idx] = all_evecs[start_idx]
+
+    for i in range(start_idx + 1, n_flux):
+        prev_prev_evals = tracked_evals[i - 2] if i - 2 >= start_idx else None
+        delta_phi = float(phi_vals[i] - phi_vals[i - 1])
+        perm = _match_branches_step(
+            tracked_evals[i - 1],
+            raw_evals[i],
+            tracked_evecs[i - 1],
+            all_evecs[i],
+            delta_phi,
+            prev_prev_evals=prev_prev_evals,
+        )
+        tracked_evals[i] = raw_evals[i][perm]
+        tracked_evecs[i] = all_evecs[i][:, perm]
+
+    for i in range(start_idx - 1, -1, -1):
+        prev_prev_evals = tracked_evals[i + 2] if i + 2 <= start_idx else None
+        delta_phi = float(phi_vals[i] - phi_vals[i + 1])
+        perm = _match_branches_step(
+            tracked_evals[i + 1],
+            raw_evals[i],
+            tracked_evecs[i + 1],
+            all_evecs[i],
+            delta_phi,
+            prev_prev_evals=prev_prev_evals,
+        )
+        tracked_evals[i] = raw_evals[i][perm]
+        tracked_evecs[i] = all_evecs[i][:, perm]
+
+    return tracked_evals, tracked_evecs
+
+
+def report_derivative_jumps(
+    tracked_evals,
+    phi_vals,
+    prefix="",
+    threshold=DERIVATIVE_JUMP_WARN_THRESHOLD,
+    max_reports=5,
+):
+    slopes = np.diff(tracked_evals, axis=0) / np.diff(phi_vals)[:, None]
+    slope_jumps = np.diff(slopes, axis=0)
+    abs_jumps = np.abs(slope_jumps)
+    if abs_jumps.size == 0:
+        return []
+
+    candidates = np.argwhere(abs_jumps >= threshold)
+    records = []
+    for flux_minus_one, level_idx in candidates:
+        records.append(
+            {
+                "level": int(level_idx),
+                "flux_index": int(flux_minus_one + 1),
+                "phi": float(phi_vals[flux_minus_one + 1]),
+                "jump": float(abs_jumps[flux_minus_one, level_idx]),
+                "slope_before": float(slopes[flux_minus_one, level_idx]),
+                "slope_after": float(slopes[flux_minus_one + 1, level_idx]),
+            }
+        )
+
+    records.sort(key=lambda rec: rec["jump"], reverse=True)
+    if not records:
+        return []
+
+    print(
+        f"{prefix} derivative smoothness: {len(records)} branch slope jumps "
+        f"above {threshold:.3g} GHz/Phi0"
+    )
+    for rec in records[:max_reports]:
+        print(
+            f"{prefix}   level={rec['level']:2d}, "
+            f"phi={rec['phi']:+.4f}, "
+            f"|Delta slope|={rec['jump']:.3g} GHz/Phi0, "
+            f"before={rec['slope_before']:.3g}, "
+            f"after={rec['slope_after']:.3g}"
+        )
+    if len(records) > max_reports:
+        print(f"{prefix}   ... {len(records) - max_reports} more not shown")
+    return records
+
+
+def _candidate_chi_at_index(tracked_evals, flux_idx, label_indices):
+    required = ((0, 0), (1, 0), (0, 1), (1, 1))
+    if any(label not in label_indices for label in required):
+        return np.nan
+    e00 = tracked_evals[flux_idx, label_indices[(0, 0)]]
+    e10 = tracked_evals[flux_idx, label_indices[(1, 0)]]
+    e01 = tracked_evals[flux_idx, label_indices[(0, 1)]]
+    e11 = tracked_evals[flux_idx, label_indices[(1, 1)]]
+    return float(e11 - e10 - e01 + e00)
+
+
+def _labels_from_indices(n_levels, label_indices):
+    labels = [None] * n_levels
+    for label, branch_idx in label_indices.items():
+        if 0 <= branch_idx < n_levels and labels[branch_idx] is None:
+            labels[branch_idx] = label
+    return labels
+
+
+def _fit_based_sweet_spot_candidate(evals_mid, omega_r_hint, omega_q_hint):
+    params = fit_effective_params_2mode(
+        evals_mid,
+        omega_r_hint=omega_r_hint,
+        omega_q_hint=omega_q_hint,
+    )
+    label_indices = {
+        (0, 0): 0,
+        (1, 0): int(params["idx_q"]),
+        (0, 1): int(params["idx_r"]),
+        (2, 0): int(params["idx_20"]),
+        (1, 1): int(params["idx_11"]),
+        (0, 2): int(params["idx_02"]),
+    }
+    if len(set(label_indices.values())) != len(label_indices):
+        raise ValueError("Fit-based sweet-spot labels map multiple labels to one branch.")
+    return label_indices
+
+
+def _analytic_sweet_spot_candidate(evals_mid, omega_r_hint):
+    energies = np.asarray(evals_mid, dtype=float)
+    energies = energies - energies[0]
+    e_q = transmon_energy_levels_ghz(
+        E_J1 + E_J2,
+        charging_energy_ghz(C_J1 + C_J2),
+        n_max=6,
+    )
+
+    candidates = []
+    for nq in range(7):
+        for nr in range(8):
+            candidates.append((e_q[nq] + nr * omega_r_hint, nq, nr))
+    candidates.sort(key=lambda item: item[0])
+
+    n_items = min(len(energies), len(candidates))
+    cost = np.full((n_items, n_items), 1e9)
+    for energy_idx in range(n_items):
+        for cand_idx in range(n_items):
+            cost[energy_idx, cand_idx] = abs(energies[energy_idx] - candidates[cand_idx][0])
+
+    row_ind, col_ind = linear_sum_assignment(cost)
+    label_indices = {}
+    for energy_idx, cand_idx in zip(row_ind, col_ind):
+        _, nq, nr = candidates[cand_idx]
+        label = (nq, nr)
+        if label not in label_indices:
+            label_indices[label] = int(energy_idx)
+
+    if (0, 0) not in label_indices:
+        label_indices[(0, 0)] = 0
+    return label_indices
+
+
+def sweet_spot_branch_labels_and_indices(
+    tracked_evals: np.ndarray,
+    mid_idx: int,
+    omega_r_hint: float,
+    omega_q_hint: float | None,
+    prefix: str = "",
+):
+    candidates = []
+    evals_mid = tracked_evals[mid_idx]
+
+    for name, builder in (
+        (
+            "fit",
+            lambda: _fit_based_sweet_spot_candidate(
+                evals_mid,
+                omega_r_hint=omega_r_hint,
+                omega_q_hint=omega_q_hint,
+            ),
+        ),
+        ("analytic", lambda: _analytic_sweet_spot_candidate(evals_mid, omega_r_hint)),
+    ):
+        try:
+            label_indices = builder()
+            chi_mid = _candidate_chi_at_index(tracked_evals, mid_idx, label_indices)
+            candidates.append((name, label_indices, chi_mid))
+            chi_text = "nan" if not np.isfinite(chi_mid) else f"{chi_mid * 1e3:.6g} MHz"
+            print(f"{prefix} sweet-spot {name} chi candidate: {chi_text}")
+        except Exception as exc:
+            print(f"{prefix} sweet-spot {name} labeling failed: {type(exc).__name__}: {exc}")
+
+    sane = [
+        candidate for candidate in candidates
+        if np.isfinite(candidate[2]) and abs(candidate[2]) <= CHI_WARN_ABS_GHZ
+    ]
+    if sane:
+        name, label_indices, chi_mid = min(sane, key=lambda item: abs(item[2]))
+    elif candidates:
+        name, label_indices, chi_mid = min(
+            candidates,
+            key=lambda item: abs(item[2]) if np.isfinite(item[2]) else np.inf,
+        )
+    else:
+        raise ValueError("Unable to build any sweet-spot branch labels.")
+
+    print(
+        f"{prefix} using {name} sweet-spot labels; "
+        f"chi_mid={chi_mid * 1e3:.6g} MHz"
+    )
+    for label in ((0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (0, 2)):
+        idx = label_indices.get(label)
+        if idx is None:
+            print(f"{prefix}   {format_label(label)} -> missing")
+        else:
+            print(
+                f"{prefix}   {format_label(label)} -> branch {idx}, "
+                f"E_mid={evals_mid[idx]:.9g} GHz"
+            )
+
+    labels = _labels_from_indices(tracked_evals.shape[1], label_indices)
+    return labels, label_indices
+
+
+def branch_followed_observables(tracked_evals, label_indices):
+    n_flux = tracked_evals.shape[0]
+    alpha_col = np.full(n_flux, np.nan)
+    chi_col = np.full(n_flux, np.nan)
+
+    idx_00 = label_indices.get((0, 0))
+    idx_10 = label_indices.get((1, 0))
+    idx_20 = label_indices.get((2, 0))
+    idx_01 = label_indices.get((0, 1))
+    idx_11 = label_indices.get((1, 1))
+
+    if idx_00 is None:
+        idx_00 = 0
+    e00 = tracked_evals[:, idx_00]
+
+    if idx_10 is not None and idx_20 is not None:
+        e10 = tracked_evals[:, idx_10]
+        e20 = tracked_evals[:, idx_20]
+        alpha_col = e20 - 2.0 * e10 + e00
+
+    if idx_10 is not None and idx_01 is not None and idx_11 is not None:
+        e10 = tracked_evals[:, idx_10]
+        e01 = tracked_evals[:, idx_01]
+        e11 = tracked_evals[:, idx_11]
+        chi_col = e11 - e10 - e01 + e00
+
+    return alpha_col, chi_col
+
+
+def fit_and_label_tracked_levels(
+    evals_rel: np.ndarray,
+    omega_r_hint: float,
+    omega_q_hint: float | None = None,
+):
+    params = fit_effective_params_2mode(
+        evals_rel,
+        omega_r_hint=omega_r_hint,
+        omega_q_hint=omega_q_hint,
+    )
+    try:
+        assignments = assign_labels_2mode(evals_rel, params, include_chi=True)
+    except Exception:
+        assignments = []
+
+    # Use exact low-level observables from assignments when available,
+    # as these are more reliable than the fitted model parameters.
+    alpha_exact, chi_exact = np.nan, np.nan
+    if assignments:
+        alpha_exact, chi_exact = extract_exact_low_level_observables(assignments)
+
+    tracked_labels = [None] * len(evals_rel)
+    tracked_labels[int(params["idx_q"])] = (1, 0)
+    tracked_labels[int(params["idx_r"])] = (0, 1)
+    tracked_labels[int(params["idx_20"])] = (2, 0)
+    tracked_labels[int(params["idx_11"])] = (1, 1)
+    tracked_labels[int(params["idx_02"])] = (0, 2)
+
+    unmatched = [a for a in assignments if tracked_labels[a["k"]] is None]
+    for energy_idx, energy in enumerate(evals_rel):
+        if tracked_labels[energy_idx] is not None or not unmatched:
             continue
         best_idx = min(
             range(len(unmatched)),
             key=lambda idx: abs(unmatched[idx]["E"] - energy),
         )
         best = unmatched.pop(best_idx)
-        tracked_labels.append((best["nq"], best["nr"]))
+        tracked_labels[energy_idx] = (best["nq"], best["nr"])
 
-    return params, tracked_labels
+    # Prefer the exact extraction; fall back to fitted params if exact is NaN.
+    final_alpha = alpha_exact if np.isfinite(alpha_exact) else params["alpha_q"]
+    final_chi = chi_exact if np.isfinite(chi_exact) else params["chi_qr"]
+
+    return {
+        "params": params,
+        "assignments": assignments,
+        "tracked_labels": tracked_labels,
+        "alpha_q": final_alpha,
+        "chi_qr": final_chi,
+    }
 
 
 def progress_stride(total_steps: int) -> int:
@@ -257,10 +833,13 @@ def sweep_beta_column(
     beta_total: int | None = None,
 ):
     circ, flux_attr, L_r = build_circuit(L_c)
-    omega_r_hint = 1.0 / (2 * np.pi * np.sqrt(L_r * C_r)) / 1e9
+    omega_r_hint = 1.0 / (2 * np.pi * np.sqrt(L_tot * C_r)) / 1e9
+    omega_q_hint = omega_q_sweet_hint_ghz()
 
     n_flux = len(phi_vals)
+    mid_idx = n_flux // 2
     raw_evals = np.full((n_flux, evals_count), np.nan)
+    all_evecs = []
     beta = L_c / L_tot
     prefix = (
         f"[beta {beta_index}/{beta_total} | beta={beta:.6f}]"
@@ -271,6 +850,11 @@ def sweep_beta_column(
     beta_start = time.perf_counter()
 
     print(f"{prefix} starting tracked sweep across {n_flux} flux points")
+    print(
+        f"{prefix} hints: omega_r={omega_r_hint:.6f} GHz "
+        f"(using L_tot={L_tot * 1e9:.6f} nH), "
+        f"omega_q={omega_q_hint:.6f} GHz"
+    )
 
     try:
         for idx, phi_ext in enumerate(phi_vals):
@@ -286,17 +870,7 @@ def sweep_beta_column(
                 evecs = evecs[:, np.newaxis]
             if evecs.shape[0] < evecs.shape[1]:
                 evecs = evecs.T
-            if idx == 0:
-                tracked_evals = np.zeros_like(raw_evals)
-                tracked_evals[0] = raw_evals[0]
-                evecs_prev = evecs
-            else:
-                overlap = np.abs(evecs.conj().T @ evecs_prev) ** 2
-                row_ind, col_ind = linear_sum_assignment(1.0 - overlap)
-                perm = np.empty_like(row_ind)
-                perm[col_ind] = row_ind
-                tracked_evals[idx] = raw_evals[idx, perm]
-                evecs_prev = evecs[:, perm]
+            all_evecs.append(evecs)
 
             step = idx + 1
             if step == 1 or step % diag_stride == 0 or step == n_flux:
@@ -311,22 +885,62 @@ def sweep_beta_column(
     except Exception:
         return None
 
-    alpha_col = np.full(n_flux, np.nan)
-    chi_col = np.full(n_flux, np.nan)
-    tracked_labels = []
+    tracked_evals, _ = track_eigenbranches(raw_evals, all_evecs, phi_vals, mid_idx)
+    report_derivative_jumps(tracked_evals, phi_vals, prefix=prefix)
 
-    for idx in range(n_flux):
-        try:
-            params, labels = fit_and_label_tracked_levels(
-                tracked_evals[idx], omega_r_hint=omega_r_hint
+    tracked_labels = [[None] * evals_count for _ in range(n_flux)]
+
+    try:
+        branch_labels, label_indices = sweet_spot_branch_labels_and_indices(
+            tracked_evals,
+            mid_idx,
+            omega_r_hint=omega_r_hint,
+            omega_q_hint=omega_q_hint,
+            prefix=prefix,
+        )
+    except Exception as exc:
+        print(f"{prefix} sweet-spot branch labeling failed: {type(exc).__name__}: {exc}")
+        branch_labels = [None] * evals_count
+        label_indices = {}
+
+    for idx, phi_ext in enumerate(phi_vals):
+        if abs(phi_ext) <= LABEL_VALID_PHI_MAX:
+            tracked_labels[idx] = list(branch_labels)
+
+    alpha_col, chi_col = branch_followed_observables(
+        tracked_evals,
+        label_indices,
+    )
+    missing_labels = [
+        format_label(label)
+        for label in ((1, 0), (2, 0), (0, 1), (1, 1))
+        if label not in label_indices
+    ]
+    if missing_labels:
+        print(
+            f"{prefix} branch-followed observables missing labels: "
+            f"{', '.join(missing_labels)}"
+        )
+    finite_chi = chi_col[np.isfinite(chi_col)]
+    if finite_chi.size:
+        warn_count = int(np.sum(np.abs(finite_chi) > CHI_WARN_ABS_GHZ))
+        print(
+            f"{prefix} branch-followed chi range: "
+            f"{np.nanmin(finite_chi) * 1e3:.6g} to "
+            f"{np.nanmax(finite_chi) * 1e3:.6g} MHz; "
+            f"chi(phi=0)={chi_col[mid_idx] * 1e3:.6g} MHz; "
+            f"finite={finite_chi.size}/{len(chi_col)}; "
+            f"|chi|>{CHI_WARN_ABS_GHZ * 1e3:.0f} MHz at {warn_count} points"
+        )
+        for sample_phi in (-0.25, 0.0, 0.25):
+            sample_idx = int(np.argmin(np.abs(phi_vals - sample_phi)))
+            value = chi_col[sample_idx]
+            value_text = "nan" if not np.isfinite(value) else f"{value * 1e3:.6g} MHz"
+            print(
+                f"{prefix}   chi(phi={phi_vals[sample_idx]:+.3f}) = {value_text}"
             )
-        except Exception:
-            tracked_labels.append([None] * evals_count)
-            continue
-
-        alpha_col[idx] = params["alpha_q"]
-        chi_col[idx] = params["chi_qr"]
-        tracked_labels.append(labels)
+    else:
+        print(f"{prefix} branch-followed chi is all NaN")
 
     return {
         "alpha": alpha_col,
@@ -342,45 +956,40 @@ def format_label(label):
     return f"|{label[0]},{label[1]}>"
 
 
-def write_sweep_csv(path, L_c_vals, phi_vals, alpha_grid, chi_grid):
-    beta_vals = L_c_vals / L_tot
-    abs_chi_grid = np.abs(chi_grid)
-
+def write_sweep_csv(path, phi_vals, column_results):
+    max_levels = max(
+        (result["tracked_evals"].shape[1] for result in column_results if result is not None),
+        default=0,
+    )
     with open(path, "w", newline="") as csvfile:
         writer = csv.writer(csvfile)
-        writer.writerow(
-            [
-                "beta",
-                "L_c_H",
-                "L_c_nH",
-                "phi_ext_over_phi0",
-                "alpha_GHz",
-                "alpha_MHz",
-                "chi_GHz",
-                "chi_MHz",
-                "abs_chi_GHz",
-                "abs_chi_MHz",
-            ]
-        )
-        for j, phi in enumerate(phi_vals):
-            for i, L_c in enumerate(L_c_vals):
-                alpha_ghz = alpha_grid[j, i]
-                chi_ghz = chi_grid[j, i]
-                abs_chi_ghz = abs_chi_grid[j, i]
-                writer.writerow(
-                    [
-                        beta_vals[i],
-                        L_c,
-                        L_c * 1e9,
-                        phi,
-                        alpha_ghz,
-                        alpha_ghz * 1e3,
-                        chi_ghz,
-                        chi_ghz * 1e3,
-                        abs_chi_ghz,
-                        abs_chi_ghz * 1e3,
-                    ]
-                )
+        header = ["beta", "phi_ext_over_phi0", "alpha_GHz", "chi_GHz", "abs_chi_GHz"]
+        header.extend(f"tracked_level_{level_idx}_GHz" for level_idx in range(max_levels))
+        header.extend(f"tracked_level_{level_idx}_label" for level_idx in range(max_levels))
+        writer.writerow(header)
+
+        for result in column_results:
+            if result is None:
+                continue
+            beta = result["beta"]
+            tracked_evals = result["tracked_evals"]
+            tracked_labels = result["tracked_labels"]
+            alpha_col = result["alpha"]
+            chi_col = result["chi"]
+            for flux_idx, phi in enumerate(phi_vals):
+                row = [
+                    beta,
+                    phi,
+                    alpha_col[flux_idx],
+                    chi_col[flux_idx],
+                    abs(chi_col[flux_idx]) if np.isfinite(chi_col[flux_idx]) else np.nan,
+                ]
+                row.extend(tracked_evals[flux_idx, level_idx] for level_idx in range(tracked_evals.shape[1]))
+                row.extend("" for _ in range(max_levels - tracked_evals.shape[1]))
+                for level_idx in range(tracked_evals.shape[1]):
+                    row.append(format_label(tracked_labels[flux_idx][level_idx]))
+                row.extend("" for _ in range(max_levels - tracked_evals.shape[1]))
+                writer.writerow(row)
 
 
 def write_crossings_csv(path, crossing_records):
@@ -396,7 +1005,6 @@ def write_crossings_csv(path, crossing_records):
                 "label_a",
                 "label_b",
                 "gap_GHz",
-                "gap_MHz",
             ]
         )
         for rec in crossing_records:
@@ -410,7 +1018,6 @@ def write_crossings_csv(path, crossing_records):
                     format_label(rec["label_a"]),
                     format_label(rec["label_b"]),
                     rec["gap_ghz"],
-                    rec["gap_ghz"] * 1e3,
                 ]
             )
 
@@ -509,17 +1116,18 @@ def detect_tracked_crossings(
 
 
 def main():
-    n_L = 201
-    n_flux = 201
-    evals_count = 10
-    L_c_vals = np.linspace(0, L_tot, n_L)
+    n_L = 11
+    n_flux = 41
+    evals_count = 12
+    beta_vals = np.linspace(0.0, 1.0, n_L)[1:-1]
+    n_L = len(beta_vals)
+    L_c_vals = beta_vals * L_tot
     phi_vals = np.linspace(-0.5, 0.5, n_flux)
-
-    L_c_vals = np.clip(L_c_vals, 1e-15, L_tot - 1e-15)
 
     alpha_grid = np.full((n_flux, n_L), np.nan)
     chi_grid = np.full((n_flux, n_L), np.nan)
     crossing_records = []
+    column_results = []
 
     total = n_L
     done = 0
@@ -528,6 +1136,10 @@ def main():
         f"Computing alpha/chi heatmaps and tracked flux-sweep crossings on "
         f"{n_L} beta columns x {n_flux} flux points "
         f"(< {MAX_OVERLAY_GAP_GHZ * 1e3:.0f} MHz gap)..."
+    )
+    print(
+        f"Tracked-level labels are anchored at the sweet spot and only written "
+        f"for |Phi| <= {LABEL_VALID_PHI_MAX:.2f} Phi0."
     )
     for i, L_c in enumerate(L_c_vals):
         beta = L_c / L_tot
@@ -540,6 +1152,7 @@ def main():
             beta_total=total,
         )
         if column is None:
+            column_results.append(None)
             done += 1
             elapsed = time.perf_counter() - overall_start
             avg_per_beta = elapsed / done
@@ -550,8 +1163,10 @@ def main():
             )
             continue
 
+        column["beta"] = beta
         alpha_grid[:, i] = column["alpha"]
         chi_grid[:, i] = column["chi"]
+        column_results.append(column)
         column_crossings = detect_tracked_crossings(
             beta, phi_vals, column["tracked_evals"], column["tracked_labels"]
         )
@@ -584,8 +1199,17 @@ def main():
     if np.all(np.isnan(chi_mhz)):
         chi_vmin, chi_vmax = -1.0, 1.0
     else:
-        chi_abs_max = float(np.nanmax(np.abs(chi_mhz)))
+        chi_abs_max = min(
+            float(np.nanmax(np.abs(chi_mhz))),
+            CHI_DISPLAY_ABS_MAX_GHZ * 1e3,
+        )
         chi_vmin, chi_vmax = -chi_abs_max, chi_abs_max
+
+    abs_chi_vmax = (
+        min(float(np.nanmax(abs_chi_mhz)), CHI_DISPLAY_ABS_MAX_GHZ * 1e3)
+        if not np.all(np.isnan(abs_chi_mhz))
+        else 1.0
+    )
 
     fig_heatmaps, (ax_alpha_only, ax_chi_only, ax_abs_chi_only) = plt.subplots(
         1, 3, figsize=(20, 5)
@@ -604,7 +1228,7 @@ def main():
     ax_alpha.set_xlabel(r"$\beta = L_c / L_\mathrm{tot}$")
     ax_alpha.set_ylabel(r"External flux $\Phi_\mathrm{ext}/\Phi_0$")
     ax_alpha.set_title(r"Anharmonicity $\alpha$ (MHz)")
-    plt.colorbar(im_alpha, ax=ax_alpha, label=r"$\alpha$ (MHz)")
+    fig.colorbar(im_alpha, ax=ax_alpha, label=r"$\alpha$ (MHz)")
 
     im_chi = ax_chi.pcolormesh(
         beta_vals,
@@ -618,7 +1242,7 @@ def main():
     ax_chi.set_xlabel(r"$\beta = L_c / L_\mathrm{tot}$")
     ax_chi.set_ylabel(r"External flux $\Phi_\mathrm{ext}/\Phi_0$")
     ax_chi.set_title(r"Dispersive shift $\chi$ (MHz)")
-    plt.colorbar(im_chi, ax=ax_chi, label=r"$\chi$ (MHz)")
+    fig.colorbar(im_chi, ax=ax_chi, label=r"$\chi$ (MHz)")
 
     im_alpha_only = ax_alpha_only.pcolormesh(
         beta_vals,
@@ -632,7 +1256,7 @@ def main():
     ax_alpha_only.set_xlabel(r"$\beta = L_c / L_\mathrm{tot}$")
     ax_alpha_only.set_ylabel(r"External flux $\Phi_\mathrm{ext}/\Phi_0$")
     ax_alpha_only.set_title(r"Anharmonicity $\alpha$ (MHz)")
-    plt.colorbar(im_alpha_only, ax=ax_alpha_only, label=r"$\alpha$ (MHz)")
+    fig_heatmaps.colorbar(im_alpha_only, ax=ax_alpha_only, label=r"$\alpha$ (MHz)")
 
     im_chi_only = ax_chi_only.pcolormesh(
         beta_vals,
@@ -646,7 +1270,7 @@ def main():
     ax_chi_only.set_xlabel(r"$\beta = L_c / L_\mathrm{tot}$")
     ax_chi_only.set_ylabel(r"External flux $\Phi_\mathrm{ext}/\Phi_0$")
     ax_chi_only.set_title(r"Dispersive shift $\chi$ (MHz)")
-    plt.colorbar(im_chi_only, ax=ax_chi_only, label=r"$\chi$ (MHz)")
+    fig_heatmaps.colorbar(im_chi_only, ax=ax_chi_only, label=r"$\chi$ (MHz)")
 
     im_abs_chi = ax_abs_chi.pcolormesh(
         beta_vals,
@@ -655,12 +1279,12 @@ def main():
         shading="auto",
         cmap="magma",
         vmin=0.0,
-        vmax=float(np.nanmax(abs_chi_mhz)) if not np.all(np.isnan(abs_chi_mhz)) else 1.0,
+        vmax=abs_chi_vmax,
     )
     ax_abs_chi.set_xlabel(r"$\beta = L_c / L_\mathrm{tot}$")
     ax_abs_chi.set_ylabel(r"External flux $\Phi_\mathrm{ext}/\Phi_0$")
     ax_abs_chi.set_title(r"Magnitude of dispersive shift $|\chi|$ (MHz)")
-    plt.colorbar(im_abs_chi, ax=ax_abs_chi, label=r"$|\chi|$ (MHz)")
+    fig.colorbar(im_abs_chi, ax=ax_abs_chi, label=r"$|\chi|$ (MHz)")
 
     im_abs_chi_only = ax_abs_chi_only.pcolormesh(
         beta_vals,
@@ -669,12 +1293,12 @@ def main():
         shading="auto",
         cmap="magma",
         vmin=0.0,
-        vmax=float(np.nanmax(abs_chi_mhz)) if not np.all(np.isnan(abs_chi_mhz)) else 1.0,
+        vmax=abs_chi_vmax,
     )
     ax_abs_chi_only.set_xlabel(r"$\beta = L_c / L_\mathrm{tot}$")
     ax_abs_chi_only.set_ylabel(r"External flux $\Phi_\mathrm{ext}/\Phi_0$")
     ax_abs_chi_only.set_title(r"Magnitude of dispersive shift $|\chi|$ (MHz)")
-    plt.colorbar(im_abs_chi_only, ax=ax_abs_chi_only, label=r"$|\chi|$ (MHz)")
+    fig_heatmaps.colorbar(im_abs_chi_only, ax=ax_abs_chi_only, label=r"$|\chi|$ (MHz)")
 
     if crossing_records:
         beta_cross = np.array([rec["beta"] for rec in crossing_records], dtype=float)
@@ -777,7 +1401,7 @@ def main():
     sweep_csv_path = "plot_output/imet_alpha_chi_vs_beta_flux.csv"
     crossings_csv_path = "plot_output/imet_alpha_chi_vs_beta_flux_crossings.csv"
     heatmaps_only_path = "plot_output/imet_alpha_chi_vs_beta_flux_heatmaps_only.png"
-    write_sweep_csv(sweep_csv_path, L_c_vals, phi_vals, alpha_grid, chi_grid)
+    write_sweep_csv(sweep_csv_path, phi_vals, column_results)
     write_crossings_csv(crossings_csv_path, crossing_records)
     out_path = "plot_output/imet_alpha_chi_vs_beta_flux.png"
     fig_heatmaps.savefig(heatmaps_only_path, dpi=150, bbox_inches="tight")

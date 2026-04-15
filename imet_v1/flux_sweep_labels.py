@@ -37,8 +37,6 @@ E_C1_ghz  = charging_energy_ghz(C_J1)
 E_C2_ghz  = charging_energy_ghz(C_J2)
 E_C_r_ghz = charging_energy_ghz(C_r)
 
-
-
 L_r_eff = L_r + L_c 
 OMEGA_R = 1.0 / np.sqrt(L_r_eff * C_r)
 OMEGA_R_GHZ = OMEGA_R / (2 * np.pi * 1e9)
@@ -81,7 +79,7 @@ def transmon_energy_levels(E_J: float, E_C: float, n_max: int = 5) -> np.ndarray
     return E_n - E_n[0]
 
 NQ_MAX = 4 
-NR_MAX = 8 
+NR_MAX = 6 
 
 def predict_2mode(phi_ext: float, chi: float = 0.0) -> dict:
     E_J = float(E_J_squid(phi_ext))
@@ -139,8 +137,8 @@ branches:
 print("\nBuilding circuit…")
 circ = scq.Circuit(iMET_yaml, from_file=False, ext_basis="harmonic")
 circ.cutoff_n_1 = 6
-circ.cutoff_ext_2 = 10
-circ.cutoff_ext_3 = 10
+circ.cutoff_ext_2 = 8
+circ.cutoff_ext_3 = 8
 
 flux_syms  = circ.external_fluxes
 flux_attrs = [str(s) for s in flux_syms]

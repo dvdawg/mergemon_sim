@@ -7,6 +7,7 @@ Colab setup (run once in a notebook cell before executing this script):
 
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm, SymLogNorm
 import scqubits as scq
 import sys
 import os
@@ -888,14 +889,25 @@ def derivative_smoothness_post_pass(
                 left_idx,
                 right_idx,
             ) in partner_candidates:
+                pair = tuple(sorted((int(level_idx), int(candidate_partner))))
                 key = _swap_key(level_idx, candidate_partner, left_idx, right_idx)
                 _pre_accepted = None
+                _blocking_key = None
                 if key in swapped_windows:
-                    # The energy-minimum window is already swapped. Try centering on
-                    # the jump, then iteratively expand outward until the window
-                    # boundary lies PAST the crossing region (or hits phi_max).
-                    # This handles crossings wider than the initial swap window.
-                    blocked_key = key
+                    _blocking_key = key
+                else:
+                    for _sw_key in swapped_windows:
+                        if _sw_key[:2] == pair:
+                            _sw_lo, _sw_hi = _sw_key[2], _sw_key[3]
+                            if _sw_lo <= right_idx and _sw_hi >= left_idx:
+                                _blocking_key = _sw_key
+                                break
+                if _blocking_key is not None:
+                    # The proposed window overlaps an already-swapped window for
+                    # this pair. Try centering on the jump, then iteratively
+                    # expand outward until the window boundary lies PAST the
+                    # crossing region (or hits phi_max).
+                    blocked_key = _blocking_key
                     blocked_lo, blocked_hi = blocked_key[2], blocked_key[3]
                     jump_phi_center = abs(float(phi_vals[jump["flux_index"]]))
                     _ext_left = int(np.argmin(np.abs(phi_vals + jump_phi_center)))
@@ -1963,6 +1975,7 @@ def main():
         alpha_vmin = float(np.nanmin(alpha_mhz))
         alpha_vmax = float(np.nanmax(alpha_mhz))
 
+    chi_norm = None
     if np.all(np.isnan(chi_mhz)):
         chi_vmin, chi_vmax = -1.0, 1.0
     else:
@@ -1971,12 +1984,29 @@ def main():
             CHI_DISPLAY_ABS_MAX_GHZ * 1e3,
         )
         chi_vmin, chi_vmax = -chi_abs_max, chi_abs_max
+        if chi_abs_max > 0.0:
+            # Symmetric log scaling keeps chi's sign while compressing large magnitudes.
+            chi_linthresh = max(0.5, chi_abs_max * 0.02)
+            chi_norm = SymLogNorm(
+                linthresh=chi_linthresh,
+                linscale=1.0,
+                vmin=chi_vmin,
+                vmax=chi_vmax,
+                base=10.0,
+            )
 
     abs_chi_vmax = (
         min(float(np.nanmax(abs_chi_mhz)), CHI_DISPLAY_ABS_MAX_GHZ * 1e3)
         if not np.all(np.isnan(abs_chi_mhz))
         else 1.0
     )
+    abs_chi_norm = None
+    finite_abs_chi = abs_chi_mhz[np.isfinite(abs_chi_mhz)]
+    positive_abs_chi = finite_abs_chi[finite_abs_chi > 0.0]
+    if positive_abs_chi.size:
+        abs_chi_vmin = max(float(np.nanmin(positive_abs_chi)), 1e-3)
+        if abs_chi_vmax > abs_chi_vmin:
+            abs_chi_norm = LogNorm(vmin=abs_chi_vmin, vmax=abs_chi_vmax)
 
     fig_heatmaps, (ax_alpha_only, ax_chi_only, ax_abs_chi_only) = plt.subplots(
         1, 3, figsize=(20, 5)
@@ -2003,8 +2033,9 @@ def main():
         chi_mhz,
         shading="auto",
         cmap="plasma",
-        vmin=chi_vmin,
-        vmax=chi_vmax,
+        norm=chi_norm,
+        vmin=None if chi_norm is not None else chi_vmin,
+        vmax=None if chi_norm is not None else chi_vmax,
     )
     ax_chi.set_xlabel(r"$\beta = L_c / L_\mathrm{tot}$")
     ax_chi.set_ylabel(r"External flux $\Phi_\mathrm{ext}/\Phi_0$")
@@ -2031,8 +2062,9 @@ def main():
         chi_mhz,
         shading="auto",
         cmap="plasma",
-        vmin=chi_vmin,
-        vmax=chi_vmax,
+        norm=chi_norm,
+        vmin=None if chi_norm is not None else chi_vmin,
+        vmax=None if chi_norm is not None else chi_vmax,
     )
     ax_chi_only.set_xlabel(r"$\beta = L_c / L_\mathrm{tot}$")
     ax_chi_only.set_ylabel(r"External flux $\Phi_\mathrm{ext}/\Phi_0$")
@@ -2045,13 +2077,16 @@ def main():
         abs_chi_mhz,
         shading="auto",
         cmap="magma",
-        vmin=0.0,
-        vmax=abs_chi_vmax,
+        norm=abs_chi_norm,
+        vmin=None if abs_chi_norm is not None else 0.0,
+        vmax=None if abs_chi_norm is not None else abs_chi_vmax,
     )
     ax_abs_chi.set_xlabel(r"$\beta = L_c / L_\mathrm{tot}$")
     ax_abs_chi.set_ylabel(r"External flux $\Phi_\mathrm{ext}/\Phi_0$")
     ax_abs_chi.set_title(r"Magnitude of dispersive shift $|\chi|$ (MHz)")
     fig.colorbar(im_abs_chi, ax=ax_abs_chi, label=r"$|\chi|$ (MHz)")
+    ax_abs_chi.set_xscale("log")
+    ax_abs_chi.set_yscale("symlog", linthresh=1e-2, linscale=1.0, base=10.0)
 
     im_abs_chi_only = ax_abs_chi_only.pcolormesh(
         beta_vals,
@@ -2059,13 +2094,16 @@ def main():
         abs_chi_mhz,
         shading="auto",
         cmap="magma",
-        vmin=0.0,
-        vmax=abs_chi_vmax,
+        norm=abs_chi_norm,
+        vmin=None if abs_chi_norm is not None else 0.0,
+        vmax=None if abs_chi_norm is not None else abs_chi_vmax,
     )
     ax_abs_chi_only.set_xlabel(r"$\beta = L_c / L_\mathrm{tot}$")
     ax_abs_chi_only.set_ylabel(r"External flux $\Phi_\mathrm{ext}/\Phi_0$")
     ax_abs_chi_only.set_title(r"Magnitude of dispersive shift $|\chi|$ (MHz)")
     fig_heatmaps.colorbar(im_abs_chi_only, ax=ax_abs_chi_only, label=r"$|\chi|$ (MHz)")
+    ax_abs_chi_only.set_xscale("log")
+    ax_abs_chi_only.set_yscale("symlog", linthresh=1e-2, linscale=1.0, base=10.0)
 
     if crossing_records:
         beta_cross = np.array([rec["beta"] for rec in crossing_records], dtype=float)

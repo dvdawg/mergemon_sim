@@ -17,7 +17,7 @@ SHOW_PLOT = False
 
 # Choose "fixed" for a beta slice or "max-abs-chi" for the envelope over beta.
 BETA_MODE = "fixed"
-BETA_VALUE = 0.1
+BETA_VALUE = 0.6
 
 
 def parse_ltot_nh(folder_name):
@@ -42,6 +42,18 @@ def find_sweep_csv(folder):
     return matches[0]
 
 
+def chi_mhz_from_row(row):
+    """Sweep CSVs use chi_GHz; older runs may have chi_MHz. Normalize to MHz for plotting."""
+    if "chi_MHz" in row and row["chi_MHz"] != "":
+        return float(row["chi_MHz"])
+    if "chi_GHz" in row and row["chi_GHz"] != "":
+        return float(row["chi_GHz"]) * 1e3
+    raise KeyError(
+        "Expected a chi column: chi_GHz (preferred) or chi_MHz; "
+        f"got keys {sorted(row.keys())!r}"
+    )
+
+
 def load_rows(csv_path):
     rows = []
     with csv_path.open(newline="") as handle:
@@ -51,7 +63,7 @@ def load_rows(csv_path):
                 {
                     "beta": float(row["beta"]),
                     "phi": float(row["phi_ext_over_phi0"]),
-                    "chi_mhz": float(row["chi_MHz"]),
+                    "chi_mhz": chi_mhz_from_row(row),
                 }
             )
 

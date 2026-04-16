@@ -29,12 +29,16 @@ NQ_MAX = 4
 NR_MAX = 6
 N_LEVELS = 12
 N_FLUX = 101
-DERIVATIVE_JUMP_WARN_THRESHOLD = 2.0
-DERIVATIVE_REPAIR_MIN_IMPROVEMENT = 0.25
-DERIVATIVE_REPAIR_MAX_PASSES = 50
-DERIVATIVE_REPAIR_WINDOW_PHI = 0.05
-FORCE_BEST_DERIVATIVE_REPAIR_SWAP = True
+DERIVATIVE_JUMP_WARN_THRESHOLD = 5.0
 LABEL_VALID_PHI_MAX = 0.45
+DERIVATIVE_CHECK_PHI_MAX = 0.45
+MAX_DERIVATIVE_SMOOTHING_SWAPS_PER_LEVEL = 4 * N_LEVELS
+DERIVATIVE_POST_PASS_DIAGNOSTIC_PARTNERS = 4
+DERIVATIVE_POST_PASS_INTERVAL_PAD_MAX = 3
+DERIVATIVE_CLOSEST_ENERGY_SEARCH_RADIUS = 3
+DERIVATIVE_MAX_CLOSEST_SWAP_GAP_GHZ = 0.75
+DERIVATIVE_SMOOTHNESS_NEIGHBORHOOD = 3
+DERIVATIVE_REPAIR_MIN_TARGET_IMPROVEMENT = 1.0
 
 
 def inductive_energy_ghz(L):
@@ -161,16 +165,11 @@ def _match_branches_step(
     curr_evecs,
     delta_phi,
     prev_prev_evals=None,
-    next_evals=None,
-    next_delta_phi=None,
     overlap_weight=4.0,
     energy_weight=0.7,
-    derivative_weight=2.5,
-    derivative_lookahead_weight=2.5,
+    derivative_weight=1.6,
     energy_scale=0.05,
-    derivative_scale=0.5,
-    derivative_hard_threshold=DERIVATIVE_JUMP_WARN_THRESHOLD,
-    derivative_hard_penalty=1.0e6,
+    derivative_scale=2.0,
 ):
     overlap = np.abs(curr_evecs.conj().T @ prev_evecs) ** 2
     cost = overlap_weight * (1.0 - overlap)
@@ -180,203 +179,13 @@ def _match_branches_step(
     if prev_prev_evals is not None:
         prev_slope = (prev_evals - prev_prev_evals) / delta_phi
         curr_slope = (curr_evals[:, None] - prev_evals[None, :]) / delta_phi
-        abs_derivative_jump = np.abs(curr_slope - prev_slope[None, :])
-        derivative_jump_cost = (abs_derivative_jump / derivative_scale) ** 2
+        derivative_jump_cost = np.abs(curr_slope - prev_slope[None, :]) / derivative_scale
         cost += derivative_weight * derivative_jump_cost
-        cost += np.where(
-            abs_derivative_jump >= derivative_hard_threshold,
-            derivative_hard_penalty
-            * (abs_derivative_jump / derivative_hard_threshold) ** 2,
-            0.0,
-        )
-
-    if next_evals is not None and next_delta_phi is not None:
-        curr_slope = (curr_evals[:, None] - prev_evals[None, :]) / delta_phi
-        next_slope = (
-            next_evals[:, None, None] - curr_evals[None, :, None]
-        ) / next_delta_phi
-        best_next_jump = np.min(np.abs(next_slope - curr_slope[None, :, :]), axis=0)
-        lookahead_cost = (best_next_jump / derivative_scale) ** 2
-        cost += derivative_lookahead_weight * lookahead_cost
-        cost += np.where(
-            best_next_jump >= derivative_hard_threshold,
-            derivative_hard_penalty
-            * (best_next_jump / derivative_hard_threshold) ** 2,
-            0.0,
-        )
 
     row_ind, col_ind = linear_sum_assignment(cost)
     perm = np.empty_like(col_ind)
     perm[col_ind] = row_ind
     return perm
-
-
-def _derivative_jump_metrics(
-    evals,
-    phi_vals,
-    valid_phi_max=LABEL_VALID_PHI_MAX,
-    threshold=DERIVATIVE_JUMP_WARN_THRESHOLD,
-):
-    slopes = np.diff(evals, axis=0) / np.diff(phi_vals)[:, None]
-    jumps = np.abs(np.diff(slopes, axis=0))
-    jump_centers = phi_vals[1:-1]
-    valid = np.abs(jump_centers) <= valid_phi_max
-    valid_jumps = jumps[valid]
-    if valid_jumps.size == 0:
-        return {"score": 0.0, "count": 0, "max": 0.0}
-
-    excess = np.maximum(valid_jumps - threshold, 0.0)
-    return {
-        "score": float(np.sum(excess**2)),
-        "count": int(np.count_nonzero(excess > 0.0)),
-        "max": float(np.max(valid_jumps)),
-    }
-
-
-def _local_derivative_jump_metrics(
-    evals,
-    phi_vals,
-    branches,
-    centers,
-    window_phi=DERIVATIVE_REPAIR_WINDOW_PHI,
-    threshold=DERIVATIVE_JUMP_WARN_THRESHOLD,
-):
-    slopes = np.diff(evals[:, branches], axis=0) / np.diff(phi_vals)[:, None]
-    jumps = np.abs(np.diff(slopes, axis=0))
-    jump_centers = phi_vals[1:-1]
-    local = np.zeros_like(jump_centers, dtype=bool)
-    for center in centers:
-        local |= np.abs(jump_centers - center) <= window_phi
-
-    local_jumps = jumps[local]
-    if local_jumps.size == 0:
-        return {"score": 0.0, "count": 0, "max": 0.0}
-
-    excess = np.maximum(local_jumps - threshold, 0.0)
-    return {
-        "score": float(np.sum(excess**2)),
-        "count": int(np.count_nonzero(excess > 0.0)),
-        "max": float(np.max(local_jumps)),
-    }
-
-
-def _symmetric_interval_for_phi(phi_vals, phi_abs):
-    lo = int(np.argmin(np.abs(phi_vals + phi_abs)))
-    hi = int(np.argmin(np.abs(phi_vals - phi_abs)))
-    if lo > hi:
-        lo, hi = hi, lo
-    return lo, hi
-
-
-def _swap_branch_interval(evals, lo, hi, a, b):
-    swapped = np.array(evals, copy=True)
-    a_values = np.array(swapped[lo : hi + 1, a], copy=True)
-    b_values = np.array(swapped[lo : hi + 1, b], copy=True)
-    swapped[lo : hi + 1, a] = b_values
-    swapped[lo : hi + 1, b] = a_values
-    return swapped
-
-
-def repair_derivative_swaps(
-    tracked_evals,
-    tracked_evecs,
-    phi_vals,
-    start_idx,
-    valid_phi_max=LABEL_VALID_PHI_MAX,
-    min_improvement=DERIVATIVE_REPAIR_MIN_IMPROVEMENT,
-    max_passes=DERIVATIVE_REPAIR_MAX_PASSES,
-):
-    repaired_evals = np.array(tracked_evals, copy=True)
-    repaired_evecs = [np.array(evec, copy=True) for evec in tracked_evecs]
-    n_flux, n_levels = repaired_evals.shape
-    slopes = np.diff(repaired_evals, axis=0) / np.diff(phi_vals)[:, None]
-    jumps = np.abs(np.diff(slopes, axis=0))
-    jump_candidates = np.argwhere(jumps >= DERIVATIVE_JUMP_WARN_THRESHOLD)
-    jump_candidates = sorted(
-        jump_candidates,
-        key=lambda item: jumps[item[0], item[1]],
-        reverse=True,
-    )
-
-    chosen = None
-    for jump_idx, a in jump_candidates:
-        jump_center_idx = int(jump_idx + 1)
-        phi = float(phi_vals[jump_center_idx])
-        if not (-valid_phi_max <= phi < 0.0):
-            continue
-
-        energies_at_jump = repaired_evals[jump_center_idx]
-        gaps = np.abs(energies_at_jump - energies_at_jump[int(a)])
-        gaps[0] = np.inf
-        gaps[int(a)] = np.inf
-        b = int(np.argmin(gaps))
-        phi_abs = abs(phi)
-        lo, hi = _symmetric_interval_for_phi(phi_vals, phi_abs)
-        if lo == 0 or hi == n_flux - 1:
-            continue
-
-        chosen = {
-            "jump_idx": int(jump_idx),
-            "jump_center_idx": jump_center_idx,
-            "jump": float(jumps[jump_idx, a]),
-            "a": int(a),
-            "b": b,
-            "lo": lo,
-            "hi": hi,
-            "gap": float(gaps[b]),
-        }
-        break
-
-    if chosen is None:
-        print(
-            "Derivative swap repair: no negative-flux derivative jumps above "
-            f"{DERIVATIVE_JUMP_WARN_THRESHOLD:.3g} GHz/Phi0 found inside "
-            f"|Phi| <= {valid_phi_max:.3g}."
-        )
-        return repaired_evals, repaired_evecs
-
-    a = chosen["a"]
-    b = chosen["b"]
-    lo = chosen["lo"]
-    hi = chosen["hi"]
-    probe_indices = sorted({lo, chosen["jump_center_idx"], start_idx, hi})
-    before_probe = [
-        (float(phi_vals[idx]), float(repaired_evals[idx, a]), float(repaired_evals[idx, b]))
-        for idx in probe_indices
-    ]
-
-    repaired_evals = _swap_branch_interval(repaired_evals, lo, hi, a, b)
-    for flux_idx in range(lo, hi + 1):
-        a_vec = np.array(repaired_evecs[flux_idx][:, a], copy=True)
-        b_vec = np.array(repaired_evecs[flux_idx][:, b], copy=True)
-        repaired_evecs[flux_idx][:, a] = b_vec
-        repaired_evecs[flux_idx][:, b] = a_vec
-
-    after_probe = [
-        (float(phi_vals[idx]), float(repaired_evals[idx, a]), float(repaired_evals[idx, b]))
-        for idx in probe_indices
-    ]
-
-    print("Derivative swap repair: force-applied closest-energy symmetric swap.")
-    print(
-        "  "
-        f"jump phi={phi_vals[chosen['jump_center_idx']]:+.4f}, "
-        f"|Delta slope|={chosen['jump']:.3g} GHz/Phi0, "
-        f"branches {a}<->{b}, closest gap={chosen['gap']:.3g} GHz"
-    )
-    print(
-        "  "
-        f"swapped interval [{phi_vals[lo]:+.4f}, {phi_vals[hi]:+.4f}] "
-        f"({hi - lo + 1} flux points)"
-    )
-    print("  probe before swap:")
-    for phi, ea, eb in before_probe:
-        print(f"    phi={phi:+.4f}: branch {a}={ea:.6g}, branch {b}={eb:.6g}")
-    print("  probe after swap:")
-    for phi, ea, eb in after_probe:
-        print(f"    phi={phi:+.4f}: branch {a}={ea:.6g}, branch {b}={eb:.6g}")
-
-    return repaired_evals, repaired_evecs
 
 
 def track_eigenbranches(raw_evals, all_evecs, phi_vals, start_idx):
@@ -390,10 +199,6 @@ def track_eigenbranches(raw_evals, all_evecs, phi_vals, start_idx):
     for i in range(start_idx + 1, n_flux):
         prev_prev_evals = tracked_evals[i - 2] if i - 2 >= start_idx else None
         delta_phi = float(phi_vals[i] - phi_vals[i - 1])
-        next_evals = raw_evals[i + 1] if i + 1 < n_flux else None
-        next_delta_phi = (
-            float(phi_vals[i + 1] - phi_vals[i]) if i + 1 < n_flux else None
-        )
         perm = _match_branches_step(
             tracked_evals[i - 1],
             raw_evals[i],
@@ -401,8 +206,6 @@ def track_eigenbranches(raw_evals, all_evecs, phi_vals, start_idx):
             all_evecs[i],
             delta_phi,
             prev_prev_evals=prev_prev_evals,
-            next_evals=next_evals,
-            next_delta_phi=next_delta_phi,
         )
         tracked_evals[i] = raw_evals[i][perm]
         tracked_evecs[i] = all_evecs[i][:, perm]
@@ -410,10 +213,6 @@ def track_eigenbranches(raw_evals, all_evecs, phi_vals, start_idx):
     for i in range(start_idx - 1, -1, -1):
         prev_prev_evals = tracked_evals[i + 2] if i + 2 <= start_idx else None
         delta_phi = float(phi_vals[i] - phi_vals[i + 1])
-        next_evals = raw_evals[i - 1] if i - 1 >= 0 else None
-        next_delta_phi = (
-            float(phi_vals[i - 1] - phi_vals[i]) if i - 1 >= 0 else None
-        )
         perm = _match_branches_step(
             tracked_evals[i + 1],
             raw_evals[i],
@@ -421,52 +220,40 @@ def track_eigenbranches(raw_evals, all_evecs, phi_vals, start_idx):
             all_evecs[i],
             delta_phi,
             prev_prev_evals=prev_prev_evals,
-            next_evals=next_evals,
-            next_delta_phi=next_delta_phi,
         )
         tracked_evals[i] = raw_evals[i][perm]
         tracked_evecs[i] = all_evecs[i][:, perm]
 
-    return repair_derivative_swaps(tracked_evals, tracked_evecs, phi_vals, start_idx)
+    return tracked_evals, tracked_evecs
 
 
 def report_derivative_jumps(
     tracked_evals,
     phi_vals,
     threshold=DERIVATIVE_JUMP_WARN_THRESHOLD,
+    phi_max=DERIVATIVE_CHECK_PHI_MAX,
     max_reports=12,
 ):
-    slopes = np.diff(tracked_evals, axis=0) / np.diff(phi_vals)[:, None]
-    slope_jumps = np.diff(slopes, axis=0)
-    abs_jumps = np.abs(slope_jumps)
-    if abs_jumps.size == 0:
-        return []
-
-    candidates = np.argwhere(abs_jumps >= threshold)
-    records = []
-    for flux_minus_one, level_idx in candidates:
-        records.append(
-            {
-                "level": int(level_idx),
-                "flux_index": int(flux_minus_one + 1),
-                "phi": float(phi_vals[flux_minus_one + 1]),
-                "jump": float(abs_jumps[flux_minus_one, level_idx]),
-                "slope_before": float(slopes[flux_minus_one, level_idx]),
-                "slope_after": float(slopes[flux_minus_one + 1, level_idx]),
-            }
-        )
+    records = _neighborhood_derivative_jump_records(
+        tracked_evals,
+        phi_vals,
+        threshold=threshold,
+        positive_half_only=False,
+        phi_max=phi_max,
+    )
 
     records.sort(key=lambda rec: rec["jump"], reverse=True)
     if not records:
         print(
-            f"Derivative smoothness check: no branch slope jumps above "
-            f"{threshold:.3g} GHz/Phi0."
+            f"Derivative smoothness check: no fitted-slope jumps above "
+            f"{threshold:.3g} GHz/Phi0 inside |Phi| <= {phi_max:.3g}."
         )
         return []
 
     print(
-        f"Derivative smoothness check: {len(records)} branch slope jumps above "
-        f"{threshold:.3g} GHz/Phi0."
+        f"Derivative smoothness check: {len(records)} fitted-slope jumps above "
+        f"{threshold:.3g} GHz/Phi0 inside |Phi| <= {phi_max:.3g} "
+        f"using {DERIVATIVE_SMOOTHNESS_NEIGHBORHOOD}-step neighborhoods."
     )
     for rec in records[:max_reports]:
         print(
@@ -480,6 +267,666 @@ def report_derivative_jumps(
     if len(records) > max_reports:
         print(f"  ... {len(records) - max_reports} more not shown")
     return records
+
+
+def report_derivative_jump_scale(
+    tracked_evals,
+    phi_vals,
+    positive_half_only=True,
+    phi_max=DERIVATIVE_CHECK_PHI_MAX,
+    max_reports=24,
+):
+    records = _neighborhood_derivative_jump_records(
+        tracked_evals,
+        phi_vals,
+        positive_half_only=positive_half_only,
+        phi_max=phi_max,
+    )
+    if not records:
+        print("Derivative jump scale: not enough flux points to compute jumps.")
+        return []
+
+    half_label = "positive-half" if positive_half_only else "full-sweep"
+    selected = np.array([rec["jump"] for rec in records if rec["level"] > 0])
+    percentiles = [50, 75, 90, 95, 98, 99, 99.5, 100]
+    values = np.percentile(selected, percentiles)
+    print(
+        f"\nDerivative jump scale ({half_label}, "
+        f"|Phi| <= {phi_max:.3g}, "
+        f"{DERIVATIVE_SMOOTHNESS_NEIGHBORHOOD}-step fitted slopes, "
+        "excluding ground branch):"
+    )
+    for pct, value in zip(percentiles, values):
+        print(f"  p{pct:>4g}: {value:.3g} GHz/Phi0")
+
+    records.sort(key=lambda rec: rec["jump"], reverse=True)
+
+    print(f"  top {min(max_reports, len(records))} jumps:")
+    for rec in records[:max_reports]:
+        print(
+            "    "
+            f"level={rec['level']:2d}, phi={rec['phi']:+.4f}, "
+            f"|Delta slope|={rec['jump']:.3g}, "
+            f"before={rec['slope_before']:.3g}, after={rec['slope_after']:.3g}"
+        )
+    return records
+
+
+def _positive_half_derivative_jumps(
+    tracked_evals,
+    phi_vals,
+    level_idx,
+    threshold=DERIVATIVE_JUMP_WARN_THRESHOLD,
+    phi_max=DERIVATIVE_CHECK_PHI_MAX,
+):
+    records = _neighborhood_derivative_jump_records(
+        tracked_evals,
+        phi_vals,
+        level_idx=level_idx,
+        threshold=threshold,
+        positive_half_only=True,
+        phi_max=phi_max,
+    )
+    records.sort(key=lambda rec: rec["jump"], reverse=True)
+    return records
+
+
+def _derivative_jump_record_at(tracked_evals, phi_vals, flux_index, level_idx):
+    return _neighborhood_derivative_jump_record_at(
+        tracked_evals,
+        phi_vals,
+        flux_index,
+        level_idx,
+    )
+
+
+def _fit_line_slope(x_vals, y_vals):
+    x = np.asarray(x_vals, dtype=float)
+    y = np.asarray(y_vals, dtype=float)
+    x_centered = x - np.mean(x)
+    denom = float(np.dot(x_centered, x_centered))
+    if denom == 0.0:
+        return 0.0
+    return float(np.dot(x_centered, y - np.mean(y)) / denom)
+
+
+def _neighborhood_derivative_jump_record_at(
+    tracked_evals,
+    phi_vals,
+    flux_index,
+    level_idx,
+    neighborhood=DERIVATIVE_SMOOTHNESS_NEIGHBORHOOD,
+):
+    left = int(flux_index) - neighborhood
+    right = int(flux_index) + neighborhood
+    if left < 0 or right >= len(phi_vals):
+        return None
+
+    slope_before = _fit_line_slope(
+        phi_vals[left : flux_index + 1],
+        tracked_evals[left : flux_index + 1, level_idx],
+    )
+    slope_after = _fit_line_slope(
+        phi_vals[flux_index : right + 1],
+        tracked_evals[flux_index : right + 1, level_idx],
+    )
+    jump = float(abs(slope_after - slope_before))
+    return {
+        "level": int(level_idx),
+        "flux_index": int(flux_index),
+        "phi": float(phi_vals[flux_index]),
+        "jump": jump,
+        "slope_before": float(slope_before),
+        "slope_after": float(slope_after),
+    }
+
+
+def _neighborhood_derivative_jump_records(
+    tracked_evals,
+    phi_vals,
+    level_idx=None,
+    threshold=None,
+    positive_half_only=False,
+    phi_max=DERIVATIVE_CHECK_PHI_MAX,
+):
+    levels = (
+        [int(level_idx)]
+        if level_idx is not None
+        else list(range(tracked_evals.shape[1]))
+    )
+    records = []
+    for flux_idx in range(
+        DERIVATIVE_SMOOTHNESS_NEIGHBORHOOD,
+        len(phi_vals) - DERIVATIVE_SMOOTHNESS_NEIGHBORHOOD,
+    ):
+        phi = float(phi_vals[flux_idx])
+        if positive_half_only:
+            if phi <= 0.0 or phi > phi_max:
+                continue
+        elif abs(phi) > phi_max:
+            continue
+        for level in levels:
+            rec = _neighborhood_derivative_jump_record_at(
+                tracked_evals,
+                phi_vals,
+                flux_idx,
+                level,
+            )
+            if rec is None:
+                continue
+            if threshold is not None and rec["jump"] < threshold:
+                continue
+            records.append(rec)
+    return records
+
+
+def _format_jump_record(record):
+    if record is None:
+        return "unavailable"
+    return (
+        f"{record['jump']:.3g} "
+        f"(before={record['slope_before']:.3g}, after={record['slope_after']:.3g})"
+    )
+
+
+def _swap_key(level_idx, partner_idx, left_idx, right_idx):
+    branch_pair = tuple(sorted((int(level_idx), int(partner_idx))))
+    return branch_pair + (int(left_idx), int(right_idx))
+
+
+def _closest_branch_at_flux(
+    tracked_evals,
+    flux_idx,
+    level_idx,
+    left_idx,
+    right_idx,
+    blocked_swap_keys,
+):
+    n_levels = tracked_evals.shape[1]
+    branch_energy = tracked_evals[flux_idx, level_idx]
+    partner_indices = np.array(
+        [idx for idx in range(1, n_levels) if idx != level_idx],
+        dtype=int,
+    )
+    if partner_indices.size == 0:
+        return None
+
+    energy_diffs = np.abs(tracked_evals[flux_idx, partner_indices] - branch_energy)
+    for order_idx in np.argsort(energy_diffs):
+        partner_idx = int(partner_indices[order_idx])
+        key = _swap_key(level_idx, partner_idx, left_idx, right_idx)
+        if key not in blocked_swap_keys:
+            return partner_idx
+    return None
+
+
+def _partner_order_for_jump(tracked_evals, flux_idx, level_idx):
+    n_levels = tracked_evals.shape[1]
+    branch_energy = tracked_evals[flux_idx, level_idx]
+    partner_indices = [idx for idx in range(1, n_levels) if idx != level_idx]
+    partner_indices.sort(key=lambda idx: abs(tracked_evals[flux_idx, idx] - branch_energy))
+    return partner_indices
+
+
+def _closest_energy_index_near_jump(
+    tracked_evals,
+    phi_vals,
+    level_idx,
+    partner_idx,
+    flux_idx,
+    search_radius=DERIVATIVE_CLOSEST_ENERGY_SEARCH_RADIUS,
+    phi_max=DERIVATIVE_CHECK_PHI_MAX,
+):
+    lo = max(0, int(flux_idx) - search_radius)
+    hi = min(len(phi_vals) - 1, int(flux_idx) + search_radius)
+    candidate_indices = [
+        idx for idx in range(lo, hi + 1) if 0.0 <= phi_vals[idx] <= phi_max
+    ]
+    if not candidate_indices:
+        return int(flux_idx)
+
+    gaps = np.abs(
+        tracked_evals[candidate_indices, level_idx]
+        - tracked_evals[candidate_indices, partner_idx]
+    )
+    return int(candidate_indices[int(np.argmin(gaps))])
+
+
+def _partner_energy_gap_diagnostics(
+    tracked_evals,
+    phi_vals,
+    level_idx,
+    flux_idx,
+    max_partners=DERIVATIVE_POST_PASS_DIAGNOSTIC_PARTNERS,
+):
+    records = []
+    for partner_idx in range(1, tracked_evals.shape[1]):
+        if partner_idx == level_idx:
+            continue
+        closest_idx = _closest_energy_index_near_jump(
+            tracked_evals,
+            phi_vals,
+            level_idx,
+            partner_idx,
+            flux_idx,
+        )
+        records.append(
+            (
+                abs(
+                    tracked_evals[closest_idx, partner_idx]
+                    - tracked_evals[closest_idx, level_idx]
+                ),
+                partner_idx,
+                closest_idx,
+            )
+        )
+    records.sort(key=lambda item: item[0])
+    return "; ".join(
+        f"level {partner_idx} min_gap={gap:.4g} at {phi_vals[closest_idx]:+.4f}"
+        for gap, partner_idx, closest_idx in records[:max_partners]
+    )
+
+
+def _swap_columns_for_rows(evals, row_indices, level_idx, partner_idx):
+    swapped = np.array(evals, copy=True)
+    level_values = swapped[row_indices, level_idx].copy()
+    swapped[row_indices, level_idx] = swapped[row_indices, partner_idx]
+    swapped[row_indices, partner_idx] = level_values
+    return swapped
+
+
+def _trial_swap_recheck(
+    evals,
+    phi_vals,
+    row_indices,
+    level_idx,
+    partner_idx,
+    flux_index,
+    threshold,
+):
+    trial_evals = _swap_columns_for_rows(evals, row_indices, level_idx, partner_idx)
+    level_recheck = _derivative_jump_record_at(
+        trial_evals,
+        phi_vals,
+        flux_index,
+        level_idx,
+    )
+    partner_recheck = _derivative_jump_record_at(
+        trial_evals,
+        phi_vals,
+        flux_index,
+        partner_idx,
+    )
+    passes = (
+        level_recheck is not None
+        and partner_recheck is not None
+        and level_recheck["jump"] < threshold
+        and partner_recheck["jump"] < threshold
+    )
+    return trial_evals, level_recheck, partner_recheck, passes
+
+
+def _candidate_swap_intervals(n_flux, left_idx, right_idx):
+    candidates = []
+    seen = set()
+
+    def add(label, lo, hi):
+        lo = max(0, int(lo))
+        hi = min(n_flux - 1, int(hi))
+        if lo > hi or (lo, hi) in seen:
+            return
+        seen.add((lo, hi))
+        candidates.append((label, lo, hi, np.arange(lo, hi + 1)))
+
+    add("base", left_idx, right_idx)
+    for pad in range(1, DERIVATIVE_POST_PASS_INTERVAL_PAD_MAX + 1):
+        add(f"symmetric-pad-{pad}", left_idx - pad, right_idx + pad)
+        add(f"right-pad-{pad}", left_idx, right_idx + pad)
+        add(f"left-pad-{pad}", left_idx - pad, right_idx)
+
+    return candidates
+
+
+def _partner_diagnostics(
+    tracked_evals,
+    flux_idx,
+    level_idx,
+    left_idx,
+    right_idx,
+    blocked_swap_keys,
+    max_partners=DERIVATIVE_POST_PASS_DIAGNOSTIC_PARTNERS,
+):
+    n_levels = tracked_evals.shape[1]
+    branch_energy = tracked_evals[flux_idx, level_idx]
+    partner_indices = np.array(
+        [idx for idx in range(1, n_levels) if idx != level_idx],
+        dtype=int,
+    )
+    if partner_indices.size == 0:
+        return "no candidate partners"
+
+    energy_diffs = np.abs(tracked_evals[flux_idx, partner_indices] - branch_energy)
+    parts = []
+    for order_idx in np.argsort(energy_diffs)[:max_partners]:
+        partner_idx = int(partner_indices[order_idx])
+        key = _swap_key(level_idx, partner_idx, left_idx, right_idx)
+        suffix = " blocked" if key in blocked_swap_keys else ""
+        parts.append(
+            f"level {partner_idx} gap={energy_diffs[order_idx]:.4g}{suffix}"
+        )
+    return "; ".join(parts)
+
+
+def derivative_smoothness_post_pass(
+    tracked_evals,
+    phi_vals,
+    threshold=DERIVATIVE_JUMP_WARN_THRESHOLD,
+):
+    smoothed_evals = np.array(tracked_evals, copy=True)
+    swaps = []
+    handled_jumps = set()
+    swapped_windows = set()
+    n_levels = smoothed_evals.shape[1]
+
+    print("\nRunning symmetric derivative-smoothness post-pass...")
+    print(
+        "  "
+        f"threshold={threshold:.3g} GHz/Phi0; checking positive-flux half "
+        f"inside |Phi| <= {DERIVATIVE_CHECK_PHI_MAX:.3g}"
+    )
+    for level_idx in range(1, n_levels - 1):
+        swaps_for_level = 0
+        initial_jumps = _positive_half_derivative_jumps(
+            smoothed_evals,
+            phi_vals,
+            level_idx,
+            threshold=threshold,
+        )
+        if initial_jumps:
+            preview = ", ".join(
+                f"+{rec['phi']:.4f} ({rec['jump']:.3g})"
+                for rec in initial_jumps[:4]
+            )
+            print(
+                "  "
+                f"level {level_idx}: {len(initial_jumps)} positive-half "
+                f"jumps above threshold; worst {preview}"
+            )
+        while swaps_for_level < MAX_DERIVATIVE_SMOOTHING_SWAPS_PER_LEVEL:
+            jumps = [
+                jump
+                for jump in _positive_half_derivative_jumps(
+                    smoothed_evals,
+                    phi_vals,
+                    level_idx,
+                    threshold=threshold,
+                )
+                if (level_idx, jump["flux_index"]) not in handled_jumps
+            ]
+            if not jumps:
+                break
+
+            jump = jumps[0]
+            phi_abs = abs(jump["phi"])
+            left_idx = int(np.argmin(np.abs(phi_vals + phi_abs)))
+            right_idx = int(np.argmin(np.abs(phi_vals - phi_abs)))
+            if left_idx > right_idx:
+                left_idx, right_idx = right_idx, left_idx
+
+            print(
+                "    "
+                f"checking level {level_idx} jump at +{phi_abs:.4f} Phi0 "
+                f"(|Delta slope|={jump['jump']:.3g}, "
+                f"before={jump['slope_before']:.3g}, "
+                f"after={jump['slope_after']:.3g}); "
+                f"window=[{phi_vals[left_idx]:+.4f}, {phi_vals[right_idx]:+.4f}]"
+            )
+            print(
+                "    "
+                "closest partners at jump: "
+                + _partner_diagnostics(
+                    smoothed_evals,
+                    jump["flux_index"],
+                    level_idx,
+                    left_idx,
+                    right_idx,
+                    swapped_windows,
+                )
+            )
+            print(
+                "    "
+                "closest local energy gaps: "
+                + _partner_energy_gap_diagnostics(
+                    smoothed_evals,
+                    phi_vals,
+                    level_idx,
+                    jump["flux_index"],
+                )
+            )
+
+            partner_idx = None
+            closest_idx = None
+            swap_left_idx = None
+            swap_right_idx = None
+            post_level_recheck = None
+            post_partner_recheck = None
+            accepted_evals = None
+            partner_candidates = []
+            for candidate_partner in range(1, n_levels):
+                if candidate_partner == level_idx:
+                    continue
+                candidate_closest_idx = _closest_energy_index_near_jump(
+                    smoothed_evals,
+                    phi_vals,
+                    level_idx,
+                    candidate_partner,
+                    jump["flux_index"],
+                )
+                candidate_phi_abs = abs(float(phi_vals[candidate_closest_idx]))
+                candidate_left_idx = int(np.argmin(np.abs(phi_vals + candidate_phi_abs)))
+                candidate_right_idx = int(np.argmin(np.abs(phi_vals - candidate_phi_abs)))
+                if candidate_left_idx > candidate_right_idx:
+                    candidate_left_idx, candidate_right_idx = (
+                        candidate_right_idx,
+                        candidate_left_idx,
+                    )
+                candidate_gap = abs(
+                    smoothed_evals[candidate_closest_idx, candidate_partner]
+                    - smoothed_evals[candidate_closest_idx, level_idx]
+                )
+                prefer_above_penalty = 0 if candidate_partner > level_idx else 1
+                partner_candidates.append(
+                    (
+                        candidate_gap,
+                        prefer_above_penalty,
+                        abs(candidate_partner - level_idx),
+                        candidate_partner,
+                        candidate_closest_idx,
+                        candidate_left_idx,
+                        candidate_right_idx,
+                    )
+                )
+
+            partner_candidates.sort(key=lambda item: item[:4])
+            for (
+                candidate_gap,
+                _prefer_above_penalty,
+                _branch_distance,
+                candidate_partner,
+                candidate_closest_idx,
+                candidate_left_idx,
+                candidate_right_idx,
+            ) in partner_candidates:
+                key = _swap_key(
+                    level_idx,
+                    candidate_partner,
+                    candidate_left_idx,
+                    candidate_right_idx,
+                )
+                if key in swapped_windows:
+                    continue
+                if candidate_gap > DERIVATIVE_MAX_CLOSEST_SWAP_GAP_GHZ:
+                    break
+                row_indices = np.arange(candidate_left_idx, candidate_right_idx + 1)
+                trial_evals = _swap_columns_for_rows(
+                    smoothed_evals,
+                    row_indices,
+                    level_idx,
+                    candidate_partner,
+                )
+                trial_level_recheck = _derivative_jump_record_at(
+                    trial_evals,
+                    phi_vals,
+                    jump["flux_index"],
+                    level_idx,
+                )
+                trial_partner_recheck = _derivative_jump_record_at(
+                    trial_evals,
+                    phi_vals,
+                    jump["flux_index"],
+                    candidate_partner,
+                )
+                before_partner_recheck = _derivative_jump_record_at(
+                    smoothed_evals,
+                    phi_vals,
+                    jump["flux_index"],
+                    candidate_partner,
+                )
+                before_worst = max(
+                    jump["jump"],
+                    0.0
+                    if before_partner_recheck is None
+                    else before_partner_recheck["jump"],
+                )
+                after_worst = max(
+                    np.inf
+                    if trial_level_recheck is None
+                    else trial_level_recheck["jump"],
+                    np.inf
+                    if trial_partner_recheck is None
+                    else trial_partner_recheck["jump"],
+                )
+                improvement = (
+                    jump["jump"]
+                    - (
+                        np.inf
+                        if trial_level_recheck is None
+                        else trial_level_recheck["jump"]
+                    )
+                )
+                print(
+                    "    "
+                    f"candidate level {candidate_partner}: closest gap="
+                    f"{candidate_gap:.4g} at {phi_vals[candidate_closest_idx]:+.4f}, "
+                    f"post fitted jumps level {level_idx}="
+                    f"{_format_jump_record(trial_level_recheck)}, "
+                    f"level {candidate_partner}="
+                    f"{_format_jump_record(trial_partner_recheck)}"
+                )
+                if (
+                    improvement >= DERIVATIVE_REPAIR_MIN_TARGET_IMPROVEMENT
+                    and after_worst <= before_worst
+                ):
+                    partner_idx = candidate_partner
+                    closest_idx = candidate_closest_idx
+                    swap_left_idx = candidate_left_idx
+                    swap_right_idx = candidate_right_idx
+                    accepted_evals = trial_evals
+                    post_level_recheck = trial_level_recheck
+                    post_partner_recheck = trial_partner_recheck
+                    break
+
+            if partner_idx is None:
+                if partner_candidates:
+                    best_gap, _, _, best_partner, best_idx, _, _ = partner_candidates[0]
+                    print(
+                        "  "
+                        f"level {level_idx}: no local branch crossing close enough "
+                        f"for jump at +{phi_abs:.4f} Phi0. Best candidate was "
+                        f"level {best_partner} with min gap={best_gap:.4g} GHz "
+                        f"at phi={phi_vals[best_idx]:+.4f}; require <= "
+                        f"{DERIVATIVE_MAX_CLOSEST_SWAP_GAP_GHZ:.3g} GHz."
+                    )
+                else:
+                    print(
+                        "  "
+                        f"level {level_idx}: no candidate partners for "
+                        f"jump at +{phi_abs:.4f} Phi0."
+                    )
+                print(
+                    "  "
+                    f"level {level_idx}: no unswapped close partner remains for "
+                    f"jump at +{phi_abs:.4f} Phi0; leaving it for review."
+                )
+                handled_jumps.add((level_idx, jump["flux_index"]))
+                continue
+
+            energy_gap = abs(
+                smoothed_evals[jump["flux_index"], partner_idx]
+                - smoothed_evals[jump["flux_index"], level_idx]
+            )
+            closest_gap = abs(
+                smoothed_evals[closest_idx, partner_idx]
+                - smoothed_evals[closest_idx, level_idx]
+            )
+            smoothed_evals = accepted_evals
+            key = _swap_key(level_idx, partner_idx, swap_left_idx, swap_right_idx)
+            swapped_windows.add(key)
+
+            swaps_for_level += 1
+            swap = {
+                "level": int(level_idx),
+                "partner": int(partner_idx),
+                "phi": float(phi_abs),
+                "closest_phi": float(phi_vals[closest_idx]),
+                "left_phi": float(phi_vals[swap_left_idx]),
+                "right_phi": float(phi_vals[swap_right_idx]),
+                "interval": "closest-energy symmetric",
+                "jump": float(jump["jump"]),
+                "rechecked_jump": float(post_level_recheck["jump"]),
+                "partner_rechecked_jump": float(post_partner_recheck["jump"]),
+            }
+            swaps.append(swap)
+
+            for handled_level in (level_idx, partner_idx):
+                for handled_flux in (
+                    jump["flux_index"] - 1,
+                    jump["flux_index"],
+                    jump["flux_index"] + 1,
+                    closest_idx - 1,
+                    closest_idx,
+                    closest_idx + 1,
+                ):
+                    if 0 <= handled_flux < len(phi_vals):
+                        handled_jumps.add((handled_level, handled_flux))
+
+            print(
+                "  "
+                f"level {level_idx} jump at +{phi_abs:.4f} Phi0 "
+                f"(|Delta slope|={jump['jump']:.3g}) -> swapped with "
+                f"level {partner_idx} over closest-energy symmetric window "
+                f"[{phi_vals[swap_left_idx]:+.4f}, "
+                f"{phi_vals[swap_right_idx]:+.4f}]. "
+                f"gap at jump={energy_gap:.4g} GHz, "
+                f"closest gap={closest_gap:.4g} GHz at "
+                f"phi={phi_vals[closest_idx]:+.4f}; "
+                f"re-check level {level_idx}={post_level_recheck['jump']:.3g}, "
+                f"level {partner_idx}={post_partner_recheck['jump']:.3g}"
+            )
+
+        if swaps_for_level >= MAX_DERIVATIVE_SMOOTHING_SWAPS_PER_LEVEL:
+            print(
+                "  "
+                f"level {level_idx}: stopped after "
+                f"{MAX_DERIVATIVE_SMOOTHING_SWAPS_PER_LEVEL} swaps; "
+                "remaining jumps may need manual review."
+            )
+
+    if not swaps:
+        print("Derivative post-pass: no symmetric branch swaps needed.")
+    else:
+        print(f"Derivative post-pass: applied {len(swaps)} symmetric branch swaps.")
+    return smoothed_evals, swaps
 
 
 def normalize_evecs(evec):
@@ -706,31 +1153,105 @@ def main():
     print("\nTracking eigenbranches with heatmap sweep rule...")
     tracked_evals, _ = track_eigenbranches(raw_evals, all_evecs, phi_vals, mid_idx)
     print("Tracking complete.")
+    report_derivative_jump_scale(tracked_evals, phi_vals)
     report_derivative_jumps(tracked_evals, phi_vals)
+
+    smoothed_evals, _ = derivative_smoothness_post_pass(
+        tracked_evals,
+        phi_vals,
+    )
+    report_derivative_jumps(smoothed_evals, phi_vals)
 
     print("\nComputing dispersive coupling chi from dressed-energy double difference")
     chi_fit = chi_from_dressed_double_difference(
-        tracked_evals[mid_idx], phi_sweet=phi_vals[mid_idx]
+        smoothed_evals[mid_idx], phi_sweet=phi_vals[mid_idx]
     )
     print(f"chi / 2pi = {chi_fit * 1e3:.2f} MHz")
 
     print("Assigning |nq, nr> labels at flux points")
-    level_labels_flux = label_flux_points(tracked_evals, phi_vals, chi_fit)
+    level_labels_flux = label_flux_points(smoothed_evals, phi_vals, chi_fit)
     branch_labels = sweet_spot_branch_labels(level_labels_flux, mid_idx)
     print(
         f"Labels assigned only for |Phi| <= {LABEL_VALID_PHI_MAX:.2f} Phi0; "
         "edge labels are treated as unreliable."
     )
 
-    print(f"\nState labels at Phi = {phi_vals[mid_idx]:.3f} Phi0 (sweet spot):")
+    print(
+        f"\nPost-pass state labels at Phi = {phi_vals[mid_idx]:.3f} Phi0 "
+        "(sweet spot):"
+    )
     for level_idx in range(1, N_LEVELS):
         nq, nr = branch_labels.get(level_idx) or (-1, -1)
         print(
             f"tracked level {level_idx:2d} -> |{nq},{nr}>, "
-            f"E = {tracked_evals[mid_idx, level_idx]:.4f} GHz"
+            f"E = {smoothed_evals[mid_idx, level_idx]:.4f} GHz"
         )
 
-    fig = plot_labelled_sweep(phi_vals, tracked_evals, branch_labels, chi_fit)
+    # Plot raw, tracked, and derivative-smoothed sweeps side by side.
+    cmap = plt.cm.tab20
+    colors = [cmap(i / max(N_LEVELS - 2, 1)) for i in range(N_LEVELS - 1)]
+
+    fig, axes = plt.subplots(1, 3, figsize=(24, 6))
+
+    ax = axes[0]
+    for i, level_idx in enumerate(range(1, N_LEVELS)):
+        ax.plot(phi_vals, raw_evals[:, level_idx], color=colors[i], linewidth=1.2, alpha=0.8)
+    ax.set_xlabel(r"External flux $\Phi_\mathrm{ext}/\Phi_0$", fontsize=AXIS_LABEL_FONTSIZE)
+    ax.set_ylabel("Energy (GHz)", fontsize=AXIS_LABEL_FONTSIZE)
+    ax.set_title("Raw eigenvalues (no tracking)", fontsize=TITLE_FONTSIZE)
+    ax.grid(True, alpha=0.25)
+    ax.tick_params(axis="both", which="major", labelsize=TICK_LABEL_FONTSIZE)
+
+    ax = axes[1]
+    for i, level_idx in enumerate(range(1, N_LEVELS)):
+        label = branch_labels.get(level_idx)
+        legend_label = (
+            f"branch {level_idx}: unlabeled"
+            if label is None
+            else f"branch {level_idx}: |{label[0]},{label[1]}>"
+        )
+        ax.plot(phi_vals, tracked_evals[:, level_idx], color=colors[i], linewidth=1.2,
+                alpha=0.8, label=legend_label)
+    ax.set_xlabel(r"External flux $\Phi_\mathrm{ext}/\Phi_0$", fontsize=AXIS_LABEL_FONTSIZE)
+    ax.set_ylabel("Energy (GHz)", fontsize=AXIS_LABEL_FONTSIZE)
+    ax.set_title("Tracked eigenvalues", fontsize=TITLE_FONTSIZE)
+    ax.legend(frameon=False, ncols=2, fontsize=LEGEND_FONTSIZE, loc="upper right")
+    ax.grid(True, alpha=0.25)
+    ax.tick_params(axis="both", which="major", labelsize=TICK_LABEL_FONTSIZE)
+
+    ax = axes[2]
+    for i, level_idx in enumerate(range(1, N_LEVELS)):
+        label = branch_labels.get(level_idx)
+        legend_label = (
+            f"branch {level_idx}: unlabeled"
+            if label is None
+            else f"branch {level_idx}: |{label[0]},{label[1]}>"
+        )
+        ax.plot(
+            phi_vals,
+            smoothed_evals[:, level_idx],
+            color=colors[i],
+            linewidth=1.2,
+            alpha=0.8,
+            label=legend_label,
+        )
+    ax.set_xlabel(r"External flux $\Phi_\mathrm{ext}/\Phi_0$", fontsize=AXIS_LABEL_FONTSIZE)
+    ax.set_ylabel("Energy (GHz)", fontsize=AXIS_LABEL_FONTSIZE)
+    ax.set_title("Derivative-smoothed eigenvalues", fontsize=TITLE_FONTSIZE)
+    ax.legend(frameon=False, ncols=2, fontsize=LEGEND_FONTSIZE, loc="upper right")
+    ax.grid(True, alpha=0.25)
+    ax.tick_params(axis="both", which="major", labelsize=TICK_LABEL_FONTSIZE)
+
+    ymax = max(axis.get_ylim()[1] for axis in axes)
+    for axis in axes:
+        axis.set_ylim(-0.3, ymax)
+
+    fig.suptitle(
+        "Raw vs tracked vs derivative-smoothed eigenvalues",
+        fontsize=SUPTITLE_FONTSIZE,
+        y=0.93,
+    )
+    fig.tight_layout()
     print_model_summary(chi_fit)
 
     os.makedirs("plot_output", exist_ok=True)

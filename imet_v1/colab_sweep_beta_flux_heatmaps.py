@@ -889,8 +889,127 @@ def derivative_smoothness_post_pass(
                 right_idx,
             ) in partner_candidates:
                 key = _swap_key(level_idx, candidate_partner, left_idx, right_idx)
+                _pre_accepted = None
                 if key in swapped_windows:
-                    continue
+                    # The energy-minimum window is already swapped. Try centering on
+                    # the jump, then iteratively expand outward until the window
+                    # boundary lies PAST the crossing region (or hits phi_max).
+                    # This handles crossings wider than the initial swap window.
+                    blocked_key = key
+                    blocked_lo, blocked_hi = blocked_key[2], blocked_key[3]
+                    jump_phi_center = abs(float(phi_vals[jump["flux_index"]]))
+                    _ext_left = int(np.argmin(np.abs(phi_vals + jump_phi_center)))
+                    _ext_right = int(np.argmin(np.abs(phi_vals - jump_phi_center)))
+                    if _ext_left > _ext_right:
+                        _ext_left, _ext_right = _ext_right, _ext_left
+
+                    while True:
+                        alt_key = _swap_key(
+                            level_idx, candidate_partner, _ext_left, _ext_right
+                        )
+                        if alt_key in swapped_windows or alt_key == blocked_key:
+                            _ext_left = max(0, _ext_left - 2)
+                            _ext_right = min(len(phi_vals) - 1, _ext_right + 2)
+                            continue
+                        if abs(phi_vals[_ext_right]) > DERIVATIVE_CHECK_PHI_MAX:
+                            break
+                        alt_gap = abs(
+                            smoothed_evals[jump["flux_index"], candidate_partner]
+                            - smoothed_evals[jump["flux_index"], level_idx]
+                        )
+                        if alt_gap > DERIVATIVE_MAX_CLOSEST_SWAP_GAP_GHZ:
+                            break
+                        # Only swap extension rows, excluding the already-swapped
+                        # blocked window to avoid double-swapping (which un-swaps).
+                        _ext_row_indices = np.array(
+                            [i for i in range(_ext_left, _ext_right + 1)
+                             if i < blocked_lo or i > blocked_hi],
+                            dtype=int,
+                        )
+                        _ext_trial_evals = _swap_columns_for_rows(
+                            smoothed_evals,
+                            _ext_row_indices,
+                            level_idx,
+                            candidate_partner,
+                        )
+                        _ext_level_recheck = _derivative_jump_record_at(
+                            _ext_trial_evals, phi_vals, jump["flux_index"], level_idx
+                        )
+                        _ext_partner_recheck = _derivative_jump_record_at(
+                            _ext_trial_evals,
+                            phi_vals,
+                            jump["flux_index"],
+                            candidate_partner,
+                        )
+                        _ext_before_partner = _derivative_jump_record_at(
+                            smoothed_evals,
+                            phi_vals,
+                            jump["flux_index"],
+                            candidate_partner,
+                        )
+                        _ext_before_worst = max(
+                            jump["jump"],
+                            0.0
+                            if _ext_before_partner is None
+                            else _ext_before_partner["jump"],
+                        )
+                        _ext_after_worst = max(
+                            np.inf
+                            if _ext_level_recheck is None
+                            else _ext_level_recheck["jump"],
+                            np.inf
+                            if _ext_partner_recheck is None
+                            else _ext_partner_recheck["jump"],
+                        )
+                        _ext_improvement = jump["jump"] - (
+                            np.inf
+                            if _ext_level_recheck is None
+                            else _ext_level_recheck["jump"]
+                        )
+                        _ext_target_fixed = (
+                            _ext_level_recheck is None
+                            or _ext_level_recheck["jump"] < threshold
+                        )
+                        print(
+                            f"{prefix}     candidate level {candidate_partner}: "
+                            f"extension window "
+                            f"[{phi_vals[_ext_left]:+.4f}, {phi_vals[_ext_right]:+.4f}] "
+                            f"(excl [{phi_vals[blocked_lo]:+.4f}, "
+                            f"{phi_vals[blocked_hi]:+.4f}]) "
+                            f"gap={alt_gap:.4g}, "
+                            f"post jumps level {level_idx}="
+                            f"{_format_jump_record(_ext_level_recheck)}, "
+                            f"level {candidate_partner}="
+                            f"{_format_jump_record(_ext_partner_recheck)}"
+                        )
+                        if (
+                            _ext_improvement >= DERIVATIVE_REPAIR_MIN_TARGET_IMPROVEMENT
+                            and (
+                                _ext_after_worst <= _ext_before_worst
+                                or _ext_target_fixed
+                            )
+                        ):
+                            _pre_accepted = {
+                                "evals": _ext_trial_evals,
+                                "partner": candidate_partner,
+                                "closest_idx": jump["flux_index"],
+                                "left_idx": _ext_left,
+                                "right_idx": _ext_right,
+                                "gap": alt_gap,
+                                "level_recheck": _ext_level_recheck,
+                                "partner_recheck": _ext_partner_recheck,
+                            }
+                            break
+                        # Not improved enough — expand window by 2 flux steps each side
+                        _ext_left = max(0, _ext_left - 2)
+                        _ext_right = min(len(phi_vals) - 1, _ext_right + 2)
+
+                    if _pre_accepted is None:
+                        continue  # No viable extension; try next candidate_partner
+
+                    accepted = _pre_accepted
+                    break  # Extension fix accepted; done with partner_candidates
+
                 if gap > DERIVATIVE_MAX_CLOSEST_SWAP_GAP_GHZ:
                     break
 
@@ -949,9 +1068,13 @@ def derivative_smoothness_post_pass(
                     f"level {candidate_partner}="
                     f"{_format_jump_record(trial_partner_recheck)}"
                 )
+                target_fixed = (
+                    trial_level_recheck is None
+                    or trial_level_recheck["jump"] < threshold
+                )
                 if (
                     improvement >= DERIVATIVE_REPAIR_MIN_TARGET_IMPROVEMENT
-                    and after_worst <= before_worst
+                    and (after_worst <= before_worst or target_fixed)
                 ):
                     accepted = {
                         "evals": trial_evals,
@@ -1009,8 +1132,12 @@ def derivative_smoothness_post_pass(
                 "left_phi": float(phi_vals[accepted["left_idx"]]),
                 "right_phi": float(phi_vals[accepted["right_idx"]]),
                 "jump": float(jump["jump"]),
-                "rechecked_jump": float(accepted["level_recheck"]["jump"]),
-                "partner_rechecked_jump": float(accepted["partner_recheck"]["jump"]),
+                "rechecked_jump": float(accepted["level_recheck"]["jump"])
+                if accepted["level_recheck"] is not None
+                else 0.0,
+                "partner_rechecked_jump": float(accepted["partner_recheck"]["jump"])
+                if accepted["partner_recheck"] is not None
+                else 0.0,
             }
             swaps.append(swap)
             print(
@@ -1230,6 +1357,37 @@ def labeled_tracked_energy_table(tracked_evals, label_indices):
     return state_order, state_energies, state_branch_indices
 
 
+def stabilize_pure_resonator_state_energies(
+    state_order,
+    state_energies,
+    mid_idx,
+    prefix="",
+):
+    stabilized_energies = np.array(state_energies, copy=True)
+    pinned_states = []
+    for row_idx, label in enumerate(state_order):
+        nq, _ = label
+        if nq != 0:
+            continue
+        sweet_spot_energy = stabilized_energies[row_idx, mid_idx]
+        if not np.isfinite(sweet_spot_energy):
+            continue
+        stabilized_energies[row_idx, :] = sweet_spot_energy
+        pinned_states.append((label, sweet_spot_energy))
+
+    if pinned_states:
+        pinned_text = ", ".join(
+            f"{format_label(label)}={energy:.9g} GHz"
+            for label, energy in pinned_states
+        )
+        print(
+            f"{prefix} holding pure resonator state energies fixed at "
+            f"sweet spot: {pinned_text}"
+        )
+
+    return stabilized_energies
+
+
 def observables_from_labeled_tracked_energies(state_order, state_energies):
     row_for_label = {label: idx for idx, label in enumerate(state_order)}
     n_flux = state_energies.shape[1]
@@ -1411,6 +1569,12 @@ def sweep_beta_column(
         tracked_evals,
         label_indices,
     )
+    state_energies = stabilize_pure_resonator_state_energies(
+        state_order,
+        state_energies,
+        mid_idx,
+        prefix=prefix,
+    )
     alpha_col, chi_col = observables_from_labeled_tracked_energies(
         state_order,
         state_energies,
@@ -1549,6 +1713,77 @@ def write_crossings_csv(path, crossing_records):
             )
 
 
+def plot_beta_flux_sweeps(phi_vals, column_results):
+    valid_columns = [result for result in column_results if result is not None]
+    if not valid_columns:
+        return None
+
+    n_cols = 3
+    n_rows = int(np.ceil(len(valid_columns) / n_cols))
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(18, 4.2 * n_rows),
+        sharex=True,
+        sharey=True,
+        squeeze=False,
+    )
+
+    max_levels = max(result["tracked_evals"].shape[1] for result in valid_columns)
+    plotted_levels = list(range(1, max_levels))
+    cmap = plt.cm.tab20
+    colors = {
+        level_idx: cmap((level_idx - 1) / max(len(plotted_levels) - 1, 1))
+        for level_idx in plotted_levels
+    }
+
+    for ax, result in zip(axes.flat, valid_columns):
+        tracked_evals = result["tracked_evals"]
+        tracked_labels = result["tracked_labels"]
+        beta = result["beta"]
+        mid_idx = len(phi_vals) // 2
+        mid_labels = (
+            tracked_labels[mid_idx]
+            if mid_idx < len(tracked_labels)
+            else [None] * tracked_evals.shape[1]
+        )
+
+        for level_idx in range(1, tracked_evals.shape[1]):
+            label = mid_labels[level_idx] if level_idx < len(mid_labels) else None
+            legend_label = (
+                f"branch {level_idx}: unlabeled"
+                if label is None
+                else f"branch {level_idx}: {format_label(label)}"
+            )
+            ax.plot(
+                phi_vals,
+                tracked_evals[:, level_idx],
+                color=colors[level_idx],
+                linewidth=1.15,
+                alpha=0.9,
+                label=legend_label,
+            )
+
+        ax.axvline(-LABEL_VALID_PHI_MAX, color="0.65", linewidth=0.8, linestyle="--")
+        ax.axvline(LABEL_VALID_PHI_MAX, color="0.65", linewidth=0.8, linestyle="--")
+        ax.set_title(rf"$\beta={beta:.3f}$")
+        ax.grid(True, alpha=0.25)
+        ax.tick_params(axis="both", labelsize=9)
+        ax.legend(frameon=False, ncols=2, fontsize=6.5, loc="upper right")
+
+    for ax in axes.flat[len(valid_columns):]:
+        ax.axis("off")
+
+    for ax in axes[-1, :]:
+        ax.set_xlabel(r"External flux $\Phi_\mathrm{ext}/\Phi_0$")
+    for ax in axes[:, 0]:
+        ax.set_ylabel("Tracked energy (GHz)")
+
+    fig.suptitle("Tracked flux sweeps by beta", fontsize=14)
+    fig.tight_layout()
+    return fig
+
+
 def detect_tracked_crossings(
     beta: float, phi_vals: np.ndarray, tracked_evals: np.ndarray, tracked_labels
 ):
@@ -1670,7 +1905,8 @@ def main():
     )
     print(
         "Heatmap alpha/chi values are computed from the labeled tracked-energy "
-        "rows built after each flux sweep."
+        "rows built after each flux sweep, with pure resonator |0,n> rows "
+        "held fixed at their sweet-spot energies."
     )
     for i, L_c in enumerate(L_c_vals):
         beta = L_c / L_tot
@@ -1927,20 +2163,26 @@ def main():
     fig_heatmaps.tight_layout()
     fig.suptitle(r"$\alpha$, $\chi$, and $|\chi|$ vs $\beta$ and flux", fontsize=14)
     fig.tight_layout()
+    sweep_fig = plot_beta_flux_sweeps(phi_vals, column_results)
 
     os.makedirs("plot_output", exist_ok=True)
     sweep_csv_path = "plot_output/imet_alpha_chi_vs_beta_flux.csv"
     crossings_csv_path = "plot_output/imet_alpha_chi_vs_beta_flux_crossings.csv"
     heatmaps_only_path = "plot_output/imet_alpha_chi_vs_beta_flux_heatmaps_only.png"
+    beta_sweeps_path = "plot_output/imet_alpha_chi_vs_beta_flux_tracked_sweeps.png"
     write_sweep_csv(sweep_csv_path, phi_vals, column_results)
     write_crossings_csv(crossings_csv_path, crossing_records)
     out_path = "plot_output/imet_alpha_chi_vs_beta_flux.png"
     fig_heatmaps.savefig(heatmaps_only_path, dpi=150, bbox_inches="tight")
-    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    if sweep_fig is not None:
+        sweep_fig.savefig(beta_sweeps_path, dpi=150, bbox_inches="tight")
     print(f"Saved {sweep_csv_path}")
     print(f"Saved {crossings_csv_path}")
     print(f"Saved {heatmaps_only_path}")
     print(f"Saved {out_path}")
+    if sweep_fig is not None:
+        print(f"Saved {beta_sweeps_path}")
     plt.show()
 
 if __name__ == "__main__":

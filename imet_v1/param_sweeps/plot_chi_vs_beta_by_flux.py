@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-DEFAULT_FLUXES = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
+DEFAULT_FLUXES = [0.0, 0.1, 0.3, 0.4, 0.5]
 DEFAULT_RESULTS_DIR = Path(__file__).resolve().parent / "sweep_results"
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "plot_output"
 CSV_GLOB = "imet_alpha_chi_vs_beta_flux*.csv"
@@ -14,16 +14,16 @@ OUTPUT_DIR = DEFAULT_OUTPUT_DIR
 FLUX_VALUES = DEFAULT_FLUXES
 # If None, use every distinct beta present in the sweep CSV (sorted).
 BETA_VALUES = None
-# Folder name under sweep_results, e.g. "Ltot_03"
-LTOT_FOLDER_NAME = "Ltot_03"
+# Total inductance in nanohenries; must match a sweep folder Ltot_* under sweep_results
+# (same convention as plot_chi_vs_ltot_by_flux.parse_ltot_nh, e.g. 0.3 -> Ltot_03).
+LTOT_NH = 0.3
 SHOW_PLOT = False
 
-# Mirror of plot_chi_vs_ltot_by_flux.BETA_MODE: slice flux or max |chi| over flux at fixed beta.
-# "fixed": nearest phi to each curve's target flux, after narrowing to the requested beta.
-# "max-abs-chi": all rows at phi matching the curve, then max |chi| over beta (independent of
-#   the x-axis beta target; yields a horizontal segment per curve if you still sweep beta on x).
+# Mirror of plot_chi_vs_ltot_by_flux.BETA_MODE (orthogonal to the swept axis).
+# "fixed": snap beta to the x-axis target, then snap phi to each curve's target flux.
+# "max-abs-chi": snap phi to each curve's target flux, then max |chi| over beta (same as the
+#   L_tot script); chi is constant along the beta axis for a given curve (horizontal lines).
 PHI_MODE = "fixed"
-PHI_VALUE = 0.1
 
 
 def parse_ltot_nh(folder_name):
@@ -35,6 +35,42 @@ def parse_ltot_nh(folder_name):
         raise ValueError(f"Could not parse Ltot from {folder_name}")
 
     return int(suffix) / (10 ** (len(suffix) - 1))
+
+
+def find_ltot_folder_by_nh(results_dir, ltot_nh):
+    """Return sweep_results/Ltot_* whose parsed L_tot (nH) matches ``ltot_nh``."""
+    target = float(ltot_nh)
+    matches = []
+    for path in sorted(p for p in results_dir.iterdir() if p.is_dir()):
+        if not path.name.startswith("Ltot_"):
+            continue
+        try:
+            parsed = parse_ltot_nh(path.name)
+        except ValueError:
+            continue
+        if np.isclose(parsed, target, rtol=0.0, atol=1e-12):
+            matches.append(path)
+
+    if not matches:
+        available = []
+        for path in sorted(p for p in results_dir.iterdir() if p.is_dir()):
+            if not path.name.startswith("Ltot_"):
+                continue
+            try:
+                available.append(f"{path.name} ({parse_ltot_nh(path.name)} nH)")
+            except ValueError:
+                available.append(path.name)
+        raise FileNotFoundError(
+            f"No folder under {results_dir} matches L_tot={target} nH. "
+            f"Available: {', '.join(available) or '(none)'}"
+        )
+    if len(matches) > 1:
+        names = ", ".join(p.name for p in matches)
+        raise ValueError(
+            f"Multiple folders match L_tot={target} nH: {names}. "
+            "Rename or remove duplicates."
+        )
+    return matches[0]
 
 
 def find_sweep_csv(folder):
@@ -87,8 +123,8 @@ def nearest_value(values, target):
     return float(values[idx]), idx
 
 
-def select_row_for_beta(rows, target_beta, target_flux, phi_mode, phi_value):
-    """Analog of select_row_for_flux: here the swept axis is beta, curves are flux."""
+def select_row_for_beta(rows, target_beta, target_flux, phi_mode):
+    """Analog of select_row_for_flux: swept axis is beta; curve parameter is flux (phi)."""
     if phi_mode == "max-abs-chi":
         phi_values = unique_sorted(row["phi"] for row in rows)
         phi_used, _ = nearest_value(phi_values, target_flux)
@@ -103,7 +139,7 @@ def select_row_for_beta(rows, target_beta, target_flux, phi_mode, phi_value):
             raise ValueError(f"No finite chi values found for flux {phi_used}")
 
         selected = max(finite_flux_rows, key=lambda row: abs(row["chi_mhz"]))
-        beta_values = unique_sorted(row["beta"] for row in finite_flux_rows)
+        beta_values = unique_sorted(row["beta"] for row in rows)
         beta_used, _ = nearest_value(beta_values, target_beta)
         return {
             "beta_requested": float(target_beta),
@@ -126,7 +162,7 @@ def select_row_for_beta(rows, target_beta, target_flux, phi_mode, phi_value):
         raise ValueError(f"No finite chi values found for beta {beta_used}")
 
     phi_values = unique_sorted(row["phi"] for row in finite_beta_rows)
-    phi_used, _ = nearest_value(phi_values, phi_value)
+    phi_used, _ = nearest_value(phi_values, target_flux)
     phi_rows = [
         row for row in finite_beta_rows if np.isclose(row["phi"], phi_used)
     ]
@@ -145,16 +181,12 @@ def select_row_for_beta(rows, target_beta, target_flux, phi_mode, phi_value):
 
 def collect_dataset(
     results_dir,
-    ltot_folder_name,
+    ltot_nh,
     flux_values,
     beta_values,
     phi_mode,
-    phi_value,
 ):
-    folder = results_dir / ltot_folder_name
-    if not folder.is_dir():
-        raise FileNotFoundError(f"Missing Ltot folder: {folder}")
-
+    folder = find_ltot_folder_by_nh(results_dir, ltot_nh)
     ltot_nh = parse_ltot_nh(folder.name)
     csv_path = find_sweep_csv(folder)
     rows = load_rows(csv_path)
@@ -174,7 +206,6 @@ def collect_dataset(
                     target_beta=float(target_beta),
                     target_flux=flux,
                     phi_mode=phi_mode,
-                    phi_value=phi_value,
                 )
             )
         beta_points.append({"flux_points": flux_points})
@@ -224,7 +255,7 @@ def write_summary_csv(dataset, output_path):
                 )
 
 
-def make_plot(dataset, phi_mode, phi_value, output_path):
+def make_plot(dataset, phi_mode, output_path):
     fig, ax = plt.subplots(figsize=(9, 6))
     item = dataset[0]
     beta_points = item["beta_points"]
@@ -249,12 +280,12 @@ def make_plot(dataset, phi_mode, phi_value, output_path):
     if phi_mode == "fixed":
         title = (
             rf"$\chi$ vs $\beta$ for selected flux biases "
-            rf"($L_\mathrm{{tot}}={ltot:.3g}$ nH, $\Phi/\Phi_0 \approx {phi_value:.3f}$)"
+            rf"($L_\mathrm{{tot}}={ltot:.3g}$ nH)"
         )
     else:
         title = (
             rf"$\chi$ vs $\beta$ for selected flux biases "
-            rf"($L_\mathrm{{tot}}={ltot:.3g}$ nH, max $|\chi|$ over $\beta$ at each flux)"
+            rf"($L_\mathrm{{tot}}={ltot:.3g}$ nH, max $|\chi|$ over $\beta$)"
         )
     ax.set_title(title)
     ax.set_xticks(x_vals)
@@ -268,11 +299,10 @@ def make_plot(dataset, phi_mode, phi_value, output_path):
 def main():
     dataset = collect_dataset(
         results_dir=RESULTS_DIR,
-        ltot_folder_name=LTOT_FOLDER_NAME,
+        ltot_nh=LTOT_NH,
         flux_values=FLUX_VALUES,
         beta_values=BETA_VALUES,
         phi_mode=PHI_MODE,
-        phi_value=PHI_VALUE,
     )
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -283,7 +313,6 @@ def main():
     fig = make_plot(
         dataset=dataset,
         phi_mode=PHI_MODE,
-        phi_value=PHI_VALUE,
         output_path=plot_path,
     )
     write_summary_csv(dataset, summary_path)

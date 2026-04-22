@@ -7,12 +7,16 @@ import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
+import matplotlib.colors as colors
 import numpy as np
 import pandas as pd
 
 
-OUTPUT_NAME = "imet_alpha_chi_vs_beta_flux_low3_crossings.png"
 DEFAULT_LEVELS = (1, 2, 3)
+DEFAULT_OUTPUT_DIRNAME = "replotted_crossings"
+UNIT_SCALE = {"GHz": 1_000.0, "MHz": 1.0}
+DISPLAY_UNIT = "MHz"
+CHI_DISPLAY_ABS_MAX_MHZ = 100.0
 
 
 def find_matching_csv(folder: Path, pattern: str, *, exclude_crossings: bool) -> Path:
@@ -45,6 +49,28 @@ def axis_edges(vals: np.ndarray) -> tuple[float, float]:
     return float(first), float(last)
 
 
+def resolve_column(df: pd.DataFrame, candidates: tuple[str, ...]) -> str:
+    for column in candidates:
+        if column in df.columns:
+            return column
+    raise KeyError(f"None of the expected columns were found: {', '.join(candidates)}")
+
+
+def unit_from_column(column: str) -> str:
+    if column.endswith("_GHz"):
+        return "GHz"
+    if column.endswith("_MHz"):
+        return "MHz"
+    return "arb."
+
+
+def scale_to_display_units(values: np.ndarray, source_unit: str) -> np.ndarray:
+    scale = UNIT_SCALE.get(source_unit)
+    if scale is None:
+        return values
+    return values * scale
+
+
 def filtered_crossings_df(path: Path, low_levels: tuple[int, ...], filter_mode: str) -> pd.DataFrame:
     df = pd.read_csv(path)
     low_level_set = set(low_levels)
@@ -61,7 +87,11 @@ def format_levels(levels: tuple[int, ...]) -> str:
     return ", ".join(str(level) for level in levels)
 
 
-def plot_folder(folder: Path, low_levels: tuple[int, ...], filter_mode: str) -> Path:
+def output_name_for_folder(folder: Path) -> str:
+    return f"{folder.name}_low3_crossings.png"
+
+
+def plot_folder(folder: Path, output_dir: Path, low_levels: tuple[int, ...], filter_mode: str) -> Path:
     sweep_csv = find_matching_csv(folder, "imet_alpha_chi_vs_beta_flux*.csv", exclude_crossings=True)
     crossings_csv = find_matching_csv(
         folder, "imet_alpha_chi_vs_beta_flux_crossings*.csv", exclude_crossings=False
@@ -70,58 +100,88 @@ def plot_folder(folder: Path, low_levels: tuple[int, ...], filter_mode: str) -> 
     sweep_df = pd.read_csv(sweep_csv)
     crossings_df = filtered_crossings_df(crossings_csv, low_levels, filter_mode)
 
+    alpha_column = resolve_column(sweep_df, ("alpha_GHz", "alpha_MHz"))
+    chi_column = resolve_column(sweep_df, ("chi_GHz", "chi_MHz"))
+    abs_chi_column = resolve_column(sweep_df, ("abs_chi_GHz", "abs_chi_MHz"))
+    source_units = unit_from_column(alpha_column)
+
     beta_vals = np.array(sorted(sweep_df["beta"].unique()), dtype=float)
     phi_vals = np.array(sorted(sweep_df["phi_ext_over_phi0"].unique()), dtype=float)
     beta_min, beta_max = axis_edges(beta_vals)
     phi_min, phi_max = axis_edges(phi_vals)
 
-    alpha_mhz = reshape_grid(sweep_df, "alpha_MHz", beta_vals, phi_vals)
-    chi_mhz = reshape_grid(sweep_df, "chi_MHz", beta_vals, phi_vals)
-    abs_chi_mhz = reshape_grid(sweep_df, "abs_chi_MHz", beta_vals, phi_vals)
+    alpha_grid = scale_to_display_units(
+        reshape_grid(sweep_df, alpha_column, beta_vals, phi_vals), source_units
+    )
+    chi_grid = scale_to_display_units(
+        reshape_grid(sweep_df, chi_column, beta_vals, phi_vals), source_units
+    )
+    abs_chi_grid = scale_to_display_units(
+        reshape_grid(sweep_df, abs_chi_column, beta_vals, phi_vals), source_units
+    )
 
-    if np.all(np.isnan(alpha_mhz)):
+    if np.all(np.isnan(alpha_grid)):
         alpha_vmin, alpha_vmax = -1.0, 1.0
     else:
-        alpha_vmin = float(np.nanmin(alpha_mhz))
-        alpha_vmax = float(np.nanmax(alpha_mhz))
+        alpha_vmin = float(np.nanmin(alpha_grid))
+        alpha_vmax = float(np.nanmax(alpha_grid))
 
-    if np.all(np.isnan(chi_mhz)):
+    chi_norm = None
+    if np.all(np.isnan(chi_grid)):
         chi_vmin, chi_vmax = -1.0, 1.0
     else:
-        chi_abs_max = float(np.nanmax(np.abs(chi_mhz)))
+        chi_abs_max = min(float(np.nanmax(np.abs(chi_grid))), CHI_DISPLAY_ABS_MAX_MHZ)
         chi_vmin, chi_vmax = -chi_abs_max, chi_abs_max
+        if chi_abs_max > 0.0:
+            chi_linthresh = max(0.5, chi_abs_max * 0.02)
+            chi_norm = colors.SymLogNorm(
+                linthresh=chi_linthresh,
+                linscale=1.0,
+                vmin=chi_vmin,
+                vmax=chi_vmax,
+                base=10.0,
+            )
+
+    abs_chi_vmax = float(np.nanmax(abs_chi_grid)) if not np.all(np.isnan(abs_chi_grid)) else 1.0
 
     fig, (ax_alpha, ax_chi, ax_abs_chi) = plt.subplots(1, 3, figsize=(20, 5))
 
     im_alpha = ax_alpha.pcolormesh(
-        beta_vals, phi_vals, alpha_mhz, shading="auto", cmap="viridis", vmin=alpha_vmin, vmax=alpha_vmax
+        beta_vals, phi_vals, alpha_grid, shading="auto", cmap="viridis", vmin=alpha_vmin, vmax=alpha_vmax
     )
     ax_alpha.set_xlabel(r"$\beta = L_c / L_\mathrm{tot}$")
     ax_alpha.set_ylabel(r"External flux $\Phi_\mathrm{ext}/\Phi_0$")
-    ax_alpha.set_title(r"Anharmonicity $\alpha$ (MHz)")
-    plt.colorbar(im_alpha, ax=ax_alpha, label=r"$\alpha$ (MHz)")
+    ax_alpha.set_title(rf"Anharmonicity $\alpha$ ({DISPLAY_UNIT})")
+    plt.colorbar(im_alpha, ax=ax_alpha, label=rf"$\alpha$ ({DISPLAY_UNIT})")
 
     im_chi = ax_chi.pcolormesh(
-        beta_vals, phi_vals, chi_mhz, shading="auto", cmap="plasma", vmin=chi_vmin, vmax=chi_vmax
+        beta_vals,
+        phi_vals,
+        chi_grid,
+        shading="auto",
+        cmap="plasma",
+        norm=chi_norm,
+        vmin=None if chi_norm is not None else chi_vmin,
+        vmax=None if chi_norm is not None else chi_vmax,
     )
     ax_chi.set_xlabel(r"$\beta = L_c / L_\mathrm{tot}$")
     ax_chi.set_ylabel(r"External flux $\Phi_\mathrm{ext}/\Phi_0$")
-    ax_chi.set_title(r"Dispersive shift $\chi$ (MHz)")
-    plt.colorbar(im_chi, ax=ax_chi, label=r"$\chi$ (MHz)")
+    ax_chi.set_title(rf"Dispersive shift $\chi$ ({DISPLAY_UNIT})")
+    plt.colorbar(im_chi, ax=ax_chi, label=rf"$\chi$ ({DISPLAY_UNIT})")
 
     im_abs_chi = ax_abs_chi.pcolormesh(
         beta_vals,
         phi_vals,
-        abs_chi_mhz,
+        abs_chi_grid,
         shading="auto",
         cmap="magma",
         vmin=0.0,
-        vmax=float(np.nanmax(abs_chi_mhz)) if not np.all(np.isnan(abs_chi_mhz)) else 1.0,
+        vmax=abs_chi_vmax,
     )
     ax_abs_chi.set_xlabel(r"$\beta = L_c / L_\mathrm{tot}$")
     ax_abs_chi.set_ylabel(r"External flux $\Phi_\mathrm{ext}/\Phi_0$")
-    ax_abs_chi.set_title(r"Magnitude of dispersive shift $|\chi|$ (MHz)")
-    plt.colorbar(im_abs_chi, ax=ax_abs_chi, label=r"$|\chi|$ (MHz)")
+    ax_abs_chi.set_title(rf"Magnitude of dispersive shift $|\chi|$ ({DISPLAY_UNIT})")
+    plt.colorbar(im_abs_chi, ax=ax_abs_chi, label=rf"$|\chi|$ ({DISPLAY_UNIT})")
 
     if not crossings_df.empty:
         beta_cross = crossings_df["beta"].to_numpy(dtype=float)
@@ -209,10 +269,14 @@ def plot_folder(folder: Path, low_levels: tuple[int, ...], filter_mode: str) -> 
     else:
         title_suffix = f"crossings involving tracked levels {format_levels(low_levels)}"
 
-    fig.suptitle(rf"$\alpha$, $\chi$, and $|\chi|$ vs $\beta$ and flux ({title_suffix})", fontsize=14)
+    fig.suptitle(
+        rf"$\alpha$, $\chi$, and $|\chi|$ vs $\beta$ and flux ({folder.name}; {title_suffix})",
+        fontsize=14,
+    )
     fig.tight_layout()
 
-    out_path = folder / OUTPUT_NAME
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = output_dir / output_name_for_folder(folder)
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return out_path
@@ -238,18 +302,25 @@ def main() -> None:
     parser.add_argument(
         "--filter-mode",
         choices=("involving", "within"),
-        default="involving",
+        default="within",
         help=(
             "'involving' keeps crossings where either level is in --levels; "
             "'within' keeps only crossings where both levels are in --levels."
         ),
     )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Directory for replotted PNGs. Default: <root>/replotted_crossings",
+    )
     args = parser.parse_args()
 
     low_levels = tuple(sorted(set(args.levels)))
-    folders = sorted(path for path in args.root.iterdir() if path.is_dir())
+    output_dir = args.output_dir if args.output_dir is not None else args.root / DEFAULT_OUTPUT_DIRNAME
+    folders = sorted(path for path in args.root.glob("Ltot_*") if path.is_dir())
     for folder in folders:
-        out_path = plot_folder(folder, low_levels, args.filter_mode)
+        out_path = plot_folder(folder, output_dir, low_levels, args.filter_mode)
         print(f"Saved {out_path}")
 
 

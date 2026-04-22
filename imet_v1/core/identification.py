@@ -126,7 +126,61 @@ def energy_of_label(assignments, nq, nr):
 
 
 if __name__ == "__main__":
-    from diag import L_c, L_r, C_r, evals_rel, f_res_bare
+    import scqubits as scq
+
+    L_r  = 0.05e-9
+    C_r  = 3.5e-12
+    L_c  = 0.05e-9
+    L_J1 = 30.0e-9
+    L_J2 = 30.0e-9
+    C_J1 = 40e-15
+    C_J2 = 40e-15
+
+    PHI0     = 2.067833848e-15
+    E_CHARGE = 1.602176634e-19
+    H        = 6.62607015e-34
+
+    def _inductive_energy_ghz(L_H):
+        return ((PHI0 / (2 * np.pi)) ** 2 / L_H) / (H * 1e9)
+
+    def _charging_energy_ghz(C_F):
+        return (E_CHARGE ** 2 / (2 * C_F)) / (H * 1e9)
+
+    E_J1  = _inductive_energy_ghz(L_J1)
+    E_J2  = _inductive_energy_ghz(L_J2)
+    E_L_c = _inductive_energy_ghz(L_c)
+    E_L_r = _inductive_energy_ghz(L_r)
+    E_C1  = _charging_energy_ghz(C_J1)
+    E_C2  = _charging_energy_ghz(C_J2)
+    E_C_r = _charging_energy_ghz(C_r)
+
+    iMET_yaml = f"""# iMET
+branches:
+- ["JJ", 1,4, {E_J1:.6g}, {E_C1:.6g}]
+- ["JJ", 1,2, {E_J2:.6g}, {E_C2:.6g}]
+- ["L", 2,4, {E_L_c:.6g}]
+- ["L", 2,3, {E_L_r:.6g}]
+- ["C", 3,4, {E_C_r:.6g}]
+"""
+
+    circ = scq.Circuit(iMET_yaml, from_file=False, ext_basis="harmonic")
+    circ.cutoff_n_1   = 6
+    circ.cutoff_ext_2 = 10
+    circ.cutoff_ext_3 = 10
+
+    _flux_syms = getattr(circ, "external_fluxes", None)
+    if _flux_syms:
+        setattr(circ, str(_flux_syms[0]), 0.0)
+
+    evals, _ = circ.eigensys(evals_count=12)
+    evals_rel = np.asarray(evals) - evals[0]
+
+    omega_r   = 1.0 / np.sqrt(L_r * C_r)
+    f_res_bare = omega_r / (2 * np.pi) / 1e9
+
+    print("\nLowest energies (GHz, shifted):")
+    for k, Ek in enumerate(evals_rel):
+        print(f"|{k:2d}> : {Ek:.6f} GHz")
 
     OMEGA_R_HINT = 5.81
 

@@ -7,7 +7,7 @@ Colab setup (run once in a notebook cell before executing this script):
 
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.colors import LogNorm, SymLogNorm
+from matplotlib.colors import SymLogNorm
 import scqubits as scq
 import sys
 import os
@@ -16,14 +16,14 @@ import time
 from scipy.optimize import linear_sum_assignment
 
 L_r_orig = 0.50e-9
-C_r = 0.80e-12
+C_r = 0.878e-12
 L_c_orig = 0.16e-9
 L_J1 = 30.0e-9
 L_J2 = 30.0e-9
 C_J1 = 40e-15
 C_J2 = 40e-15
 
-L_tot = L_r_orig + L_c_orig
+L_tot = 0.6e-9
 
 class HiddenPrints:
     def __enter__(self):
@@ -432,8 +432,10 @@ MAX_DERIVATIVE_SMOOTHING_SWAPS_PER_LEVEL = 4 * 12
 DERIVATIVE_POST_PASS_DIAGNOSTIC_PARTNERS = 4
 DERIVATIVE_CLOSEST_ENERGY_SEARCH_RADIUS = 3
 DERIVATIVE_MAX_CLOSEST_SWAP_GAP_GHZ = 0.75
+DERIVATIVE_MAX_SWAP_WINDOW = 0.25
 DERIVATIVE_SMOOTHNESS_NEIGHBORHOOD = 3
-DERIVATIVE_REPAIR_MIN_TARGET_IMPROVEMENT = 1.0
+DERIVATIVE_REPAIR_MIN_TARGET_ABS_IMPROVEMENT = 0.5
+DERIVATIVE_REPAIR_MIN_TARGET_REL_IMPROVEMENT = 0.12
 CHI_WARN_ABS_GHZ = 0.1
 CHI_DISPLAY_ABS_MAX_GHZ = 0.1
 
@@ -747,6 +749,24 @@ def _swap_columns_for_rows(evals, row_indices, level_idx, partner_idx):
     return swapped
 
 
+def _meets_derivative_repair_improvement_gate(before_jump, after_jump):
+    if not np.isfinite(before_jump) or before_jump <= 0.0:
+        return False
+    if not np.isfinite(after_jump):
+        return False
+
+    improvement = before_jump - after_jump
+    rel_improvement = improvement / max(before_jump, np.finfo(float).eps)
+    return (
+        improvement >= DERIVATIVE_REPAIR_MIN_TARGET_ABS_IMPROVEMENT
+        or rel_improvement >= DERIVATIVE_REPAIR_MIN_TARGET_REL_IMPROVEMENT
+    )
+
+
+def _swap_window_size(phi_vals, left_idx, right_idx):
+    return abs(float(phi_vals[right_idx]) - float(phi_vals[left_idx]))
+
+
 def _partner_diagnostics(
     tracked_evals,
     phi_vals,
@@ -787,8 +807,8 @@ def derivative_smoothness_post_pass(
     swaps = []
     handled_jumps = set()
     swapped_windows = set()
+    used_levels = set()
     n_levels = smoothed_evals.shape[1]
-    max_swaps_per_level = 4 * n_levels
 
     print(
         f"{prefix} running fitted-derivative branch post-pass "
@@ -796,7 +816,12 @@ def derivative_smoothness_post_pass(
         f"|Phi| <= {DERIVATIVE_CHECK_PHI_MAX:.3g})"
     )
     for level_idx in range(1, n_levels - 1):
-        swaps_for_level = 0
+        if level_idx in used_levels:
+            print(
+                f"{prefix}   level {level_idx}: skipping post-pass swaps "
+                f"(already used in this pass)"
+            )
+            continue
         initial_jumps = _positive_half_derivative_jumps(
             smoothed_evals,
             phi_vals,
@@ -813,7 +838,7 @@ def derivative_smoothness_post_pass(
                 f"positive-half fitted jumps; worst {preview}"
             )
 
-        while swaps_for_level < max_swaps_per_level:
+        while True:
             jumps = [
                 jump
                 for jump in _positive_half_derivative_jumps(
@@ -850,6 +875,8 @@ def derivative_smoothness_post_pass(
             for candidate_partner in range(1, n_levels):
                 if candidate_partner == level_idx:
                     continue
+                if candidate_partner in used_levels:
+                    continue
                 closest_idx = _closest_energy_index_near_jump(
                     smoothed_evals,
                     phi_vals,
@@ -866,9 +893,13 @@ def derivative_smoothness_post_pass(
                 right_idx = int(np.argmin(np.abs(phi_vals - phi_center)))
                 if left_idx > right_idx:
                     left_idx, right_idx = right_idx, left_idx
+                window_size = _swap_window_size(phi_vals, left_idx, right_idx)
+                if window_size > DERIVATIVE_MAX_SWAP_WINDOW:
+                    continue
                 prefer_above_penalty = 0 if candidate_partner > level_idx else 1
                 partner_candidates.append(
                     (
+                        window_size,
                         gap,
                         prefer_above_penalty,
                         abs(candidate_partner - level_idx),
@@ -879,8 +910,9 @@ def derivative_smoothness_post_pass(
                     )
                 )
 
-            partner_candidates.sort(key=lambda item: item[:4])
+            partner_candidates.sort(key=lambda item: item[:5])
             for (
+                window_size,
                 gap,
                 _prefer_above_penalty,
                 _branch_distance,
@@ -889,25 +921,14 @@ def derivative_smoothness_post_pass(
                 left_idx,
                 right_idx,
             ) in partner_candidates:
-                pair = tuple(sorted((int(level_idx), int(candidate_partner))))
                 key = _swap_key(level_idx, candidate_partner, left_idx, right_idx)
                 _pre_accepted = None
-                _blocking_key = None
                 if key in swapped_windows:
-                    _blocking_key = key
-                else:
-                    for _sw_key in swapped_windows:
-                        if _sw_key[:2] == pair:
-                            _sw_lo, _sw_hi = _sw_key[2], _sw_key[3]
-                            if _sw_lo <= right_idx and _sw_hi >= left_idx:
-                                _blocking_key = _sw_key
-                                break
-                if _blocking_key is not None:
-                    # The proposed window overlaps an already-swapped window for
-                    # this pair. Try centering on the jump, then iteratively
-                    # expand outward until the window boundary lies PAST the
-                    # crossing region (or hits phi_max).
-                    blocked_key = _blocking_key
+                    # The energy-minimum window is already swapped. Try centering on
+                    # the jump, then iteratively expand outward until the window
+                    # boundary lies PAST the crossing region (or hits phi_max).
+                    # This handles crossings wider than the initial swap window.
+                    blocked_key = key
                     blocked_lo, blocked_hi = blocked_key[2], blocked_key[3]
                     jump_phi_center = abs(float(phi_vals[jump["flux_index"]]))
                     _ext_left = int(np.argmin(np.abs(phi_vals + jump_phi_center)))
@@ -916,12 +937,21 @@ def derivative_smoothness_post_pass(
                         _ext_left, _ext_right = _ext_right, _ext_left
 
                     while True:
+                        _ext_window_size = _swap_window_size(
+                            phi_vals, _ext_left, _ext_right
+                        )
+                        if _ext_window_size > DERIVATIVE_MAX_SWAP_WINDOW:
+                            break
                         alt_key = _swap_key(
                             level_idx, candidate_partner, _ext_left, _ext_right
                         )
                         if alt_key in swapped_windows or alt_key == blocked_key:
-                            _ext_left = max(0, _ext_left - 2)
-                            _ext_right = min(len(phi_vals) - 1, _ext_right + 2)
+                            next_left = max(0, _ext_left - 2)
+                            next_right = min(len(phi_vals) - 1, _ext_right + 2)
+                            if next_left == _ext_left and next_right == _ext_right:
+                                break
+                            _ext_left = next_left
+                            _ext_right = next_right
                             continue
                         if abs(phi_vals[_ext_right]) > DERIVATIVE_CHECK_PHI_MAX:
                             break
@@ -973,10 +1003,14 @@ def derivative_smoothness_post_pass(
                             if _ext_partner_recheck is None
                             else _ext_partner_recheck["jump"],
                         )
-                        _ext_improvement = jump["jump"] - (
+                        _ext_after_target_jump = (
                             np.inf
                             if _ext_level_recheck is None
                             else _ext_level_recheck["jump"]
+                        )
+                        _ext_improvement = jump["jump"] - _ext_after_target_jump
+                        _ext_rel_improvement = _ext_improvement / max(
+                            jump["jump"], np.finfo(float).eps
                         )
                         _ext_target_fixed = (
                             _ext_level_recheck is None
@@ -988,14 +1022,19 @@ def derivative_smoothness_post_pass(
                             f"[{phi_vals[_ext_left]:+.4f}, {phi_vals[_ext_right]:+.4f}] "
                             f"(excl [{phi_vals[blocked_lo]:+.4f}, "
                             f"{phi_vals[blocked_hi]:+.4f}]) "
+                            f"width={_ext_window_size:.4f}, "
                             f"gap={alt_gap:.4g}, "
+                            f"improve={_ext_improvement:.3g} "
+                            f"({100.0 * _ext_rel_improvement:.1f}%), "
                             f"post jumps level {level_idx}="
                             f"{_format_jump_record(_ext_level_recheck)}, "
                             f"level {candidate_partner}="
                             f"{_format_jump_record(_ext_partner_recheck)}"
                         )
                         if (
-                            _ext_improvement >= DERIVATIVE_REPAIR_MIN_TARGET_IMPROVEMENT
+                            _meets_derivative_repair_improvement_gate(
+                                jump["jump"], _ext_after_target_jump
+                            )
                             and (
                                 _ext_after_worst <= _ext_before_worst
                                 or _ext_target_fixed
@@ -1007,6 +1046,7 @@ def derivative_smoothness_post_pass(
                                 "closest_idx": jump["flux_index"],
                                 "left_idx": _ext_left,
                                 "right_idx": _ext_right,
+                                "window_size": _ext_window_size,
                                 "gap": alt_gap,
                                 "level_recheck": _ext_level_recheck,
                                 "partner_recheck": _ext_partner_recheck,
@@ -1064,17 +1104,21 @@ def derivative_smoothness_post_pass(
                     if trial_partner_recheck is None
                     else trial_partner_recheck["jump"],
                 )
-                improvement = (
-                    jump["jump"]
-                    - (
-                        np.inf
-                        if trial_level_recheck is None
-                        else trial_level_recheck["jump"]
-                    )
+                after_target_jump = (
+                    np.inf
+                    if trial_level_recheck is None
+                    else trial_level_recheck["jump"]
+                )
+                improvement = jump["jump"] - after_target_jump
+                rel_improvement = improvement / max(
+                    jump["jump"], np.finfo(float).eps
                 )
                 print(
                     f"{prefix}     candidate level {candidate_partner}: "
                     f"closest gap={gap:.4g} at {phi_vals[closest_idx]:+.4f}, "
+                    f"width={window_size:.4f}, "
+                    f"improve={improvement:.3g} "
+                    f"({100.0 * rel_improvement:.1f}%), "
                     f"post jumps level {level_idx}="
                     f"{_format_jump_record(trial_level_recheck)}, "
                     f"level {candidate_partner}="
@@ -1085,7 +1129,9 @@ def derivative_smoothness_post_pass(
                     or trial_level_recheck["jump"] < threshold
                 )
                 if (
-                    improvement >= DERIVATIVE_REPAIR_MIN_TARGET_IMPROVEMENT
+                    _meets_derivative_repair_improvement_gate(
+                        jump["jump"], after_target_jump
+                    )
                     and (after_worst <= before_worst or target_fixed)
                 ):
                     accepted = {
@@ -1094,6 +1140,7 @@ def derivative_smoothness_post_pass(
                         "closest_idx": closest_idx,
                         "left_idx": left_idx,
                         "right_idx": right_idx,
+                        "window_size": window_size,
                         "gap": gap,
                         "level_recheck": trial_level_recheck,
                         "partner_recheck": trial_partner_recheck,
@@ -1102,11 +1149,21 @@ def derivative_smoothness_post_pass(
 
             if accepted is None:
                 if partner_candidates:
-                    best_gap, _, _, best_partner, best_idx, _, _ = partner_candidates[0]
+                    (
+                        best_window_size,
+                        best_gap,
+                        _,
+                        _,
+                        best_partner,
+                        best_idx,
+                        _,
+                        _,
+                    ) = partner_candidates[0]
                     print(
                         f"{prefix}   level {level_idx}: no accepted swap for "
-                        f"+{phi_abs:.4f}; best local gap was level "
-                        f"{best_partner} gap={best_gap:.4g} at "
+                        f"+{phi_abs:.4f}; best local candidate was level "
+                        f"{best_partner} width={best_window_size:.4f}, "
+                        f"gap={best_gap:.4g} at "
                         f"{phi_vals[best_idx]:+.4f}"
                     )
                 handled_jumps.add((level_idx, jump["flux_index"]))
@@ -1114,6 +1171,8 @@ def derivative_smoothness_post_pass(
 
             partner_idx = accepted["partner"]
             smoothed_evals = accepted["evals"]
+            used_levels.add(level_idx)
+            used_levels.add(partner_idx)
             swapped_windows.add(
                 _swap_key(
                     level_idx,
@@ -1122,7 +1181,6 @@ def derivative_smoothness_post_pass(
                     accepted["right_idx"],
                 )
             )
-            swaps_for_level += 1
 
             for handled_level in (level_idx, partner_idx):
                 for handled_flux in (
@@ -1143,6 +1201,7 @@ def derivative_smoothness_post_pass(
                 "closest_phi": float(phi_vals[accepted["closest_idx"]]),
                 "left_phi": float(phi_vals[accepted["left_idx"]]),
                 "right_phi": float(phi_vals[accepted["right_idx"]]),
+                "window_size": float(accepted["window_size"]),
                 "jump": float(jump["jump"]),
                 "rechecked_jump": float(accepted["level_recheck"]["jump"])
                 if accepted["level_recheck"] is not None
@@ -1156,17 +1215,13 @@ def derivative_smoothness_post_pass(
                 f"{prefix}   level {level_idx} jump at +{phi_abs:.4f} "
                 f"-> swapped with level {partner_idx} over "
                 f"[{swap['left_phi']:+.4f}, {swap['right_phi']:+.4f}], "
+                f"width={swap['window_size']:.4f}, "
                 f"closest gap={accepted['gap']:.4g} GHz at "
                 f"{swap['closest_phi']:+.4f}; post jumps "
                 f"level {level_idx}={swap['rechecked_jump']:.3g}, "
                 f"level {partner_idx}={swap['partner_rechecked_jump']:.3g}"
             )
-
-        if swaps_for_level >= max_swaps_per_level:
-            print(
-                f"{prefix}   level {level_idx}: stopped after "
-                f"{max_swaps_per_level} post-pass swaps"
-            )
+            break
 
     if swaps:
         print(f"{prefix} derivative post-pass applied {len(swaps)} swaps")
@@ -2000,13 +2055,6 @@ def main():
         if not np.all(np.isnan(abs_chi_mhz))
         else 1.0
     )
-    abs_chi_norm = None
-    finite_abs_chi = abs_chi_mhz[np.isfinite(abs_chi_mhz)]
-    positive_abs_chi = finite_abs_chi[finite_abs_chi > 0.0]
-    if positive_abs_chi.size:
-        abs_chi_vmin = max(float(np.nanmin(positive_abs_chi)), 1e-3)
-        if abs_chi_vmax > abs_chi_vmin:
-            abs_chi_norm = LogNorm(vmin=abs_chi_vmin, vmax=abs_chi_vmax)
 
     fig_heatmaps, (ax_alpha_only, ax_chi_only, ax_abs_chi_only) = plt.subplots(
         1, 3, figsize=(20, 5)
@@ -2077,16 +2125,13 @@ def main():
         abs_chi_mhz,
         shading="auto",
         cmap="magma",
-        norm=abs_chi_norm,
-        vmin=None if abs_chi_norm is not None else 0.0,
-        vmax=None if abs_chi_norm is not None else abs_chi_vmax,
+        vmin=0.0,
+        vmax=abs_chi_vmax,
     )
     ax_abs_chi.set_xlabel(r"$\beta = L_c / L_\mathrm{tot}$")
     ax_abs_chi.set_ylabel(r"External flux $\Phi_\mathrm{ext}/\Phi_0$")
     ax_abs_chi.set_title(r"Magnitude of dispersive shift $|\chi|$ (MHz)")
     fig.colorbar(im_abs_chi, ax=ax_abs_chi, label=r"$|\chi|$ (MHz)")
-    ax_abs_chi.set_xscale("log")
-    ax_abs_chi.set_yscale("symlog", linthresh=1e-2, linscale=1.0, base=10.0)
 
     im_abs_chi_only = ax_abs_chi_only.pcolormesh(
         beta_vals,
@@ -2094,16 +2139,13 @@ def main():
         abs_chi_mhz,
         shading="auto",
         cmap="magma",
-        norm=abs_chi_norm,
-        vmin=None if abs_chi_norm is not None else 0.0,
-        vmax=None if abs_chi_norm is not None else abs_chi_vmax,
+        vmin=0.0,
+        vmax=abs_chi_vmax,
     )
     ax_abs_chi_only.set_xlabel(r"$\beta = L_c / L_\mathrm{tot}$")
     ax_abs_chi_only.set_ylabel(r"External flux $\Phi_\mathrm{ext}/\Phi_0$")
     ax_abs_chi_only.set_title(r"Magnitude of dispersive shift $|\chi|$ (MHz)")
     fig_heatmaps.colorbar(im_abs_chi_only, ax=ax_abs_chi_only, label=r"$|\chi|$ (MHz)")
-    ax_abs_chi_only.set_xscale("log")
-    ax_abs_chi_only.set_yscale("symlog", linthresh=1e-2, linscale=1.0, base=10.0)
 
     if crossing_records:
         beta_cross = np.array([rec["beta"] for rec in crossing_records], dtype=float)

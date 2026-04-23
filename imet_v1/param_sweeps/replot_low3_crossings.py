@@ -19,6 +19,28 @@ DISPLAY_UNIT = "MHz"
 CHI_DISPLAY_ABS_MAX_MHZ = 100.0
 
 
+def default_results_dir() -> Path:
+    script_dir = Path(__file__).resolve().parent
+    candidates = [
+        script_dir / "sweep_results",
+        script_dir / "sweep_results_10ghz_res",
+        script_dir / "sweep_results_6.9ghz_res",
+    ]
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+
+    available = sorted(
+        path.name for path in script_dir.iterdir()
+        if path.is_dir() and path.name.startswith("sweep_results")
+    )
+    raise FileNotFoundError(
+        "Could not find a sweep results directory next to the script. "
+        f"Looked for: {', '.join(path.name for path in candidates)}. "
+        f"Available sweep result directories: {', '.join(available) or '(none)'}"
+    )
+
+
 def find_matching_csv(folder: Path, pattern: str, *, exclude_crossings: bool) -> Path:
     matches = sorted(
         path
@@ -289,7 +311,7 @@ def main() -> None:
     parser.add_argument(
         "--root",
         type=Path,
-        default=Path(__file__).resolve().parent / "sweep_results",
+        default=default_results_dir(),
         help="Directory containing the per-sweep result folders.",
     )
     parser.add_argument(

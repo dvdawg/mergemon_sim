@@ -5,18 +5,15 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-DEFAULT_FLUXES = [0.0, 0.1, 0.3, 0.4, 0.5]
-DEFAULT_RESULTS_DIR = Path(__file__).resolve().parent / "sweep_results"
-DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "plot_output"
+DEFAULT_FLUXES = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
+DEFAULT_OUTPUT_SUBDIR = "plot_output"
 CSV_GLOB = "imet_alpha_chi_vs_beta_flux*.csv"
-RESULTS_DIR = DEFAULT_RESULTS_DIR
-OUTPUT_DIR = DEFAULT_OUTPUT_DIR
 FLUX_VALUES = DEFAULT_FLUXES
 # If None, use every distinct beta present in the sweep CSV (sorted).
 BETA_VALUES = None
-# Total inductance in nanohenries; must match a sweep folder Ltot_* under sweep_results
-# (same convention as plot_chi_vs_ltot_by_flux.parse_ltot_nh, e.g. 0.3 -> Ltot_03).
-LTOT_NH = 0.3
+# Total inductance in nanohenries. If None, choose a sensible default from the
+# available sweep folders for the selected results directory.
+LTOT_NH = 0.07
 SHOW_PLOT = False
 
 # Mirror of plot_chi_vs_ltot_by_flux.BETA_MODE (orthogonal to the swept axis).
@@ -24,6 +21,31 @@ SHOW_PLOT = False
 # "max-abs-chi": snap phi to each curve's target flux, then max |chi| over beta (same as the
 #   L_tot script); chi is constant along the beta axis for a given curve (horizontal lines).
 PHI_MODE = "fixed"
+
+
+def default_results_dir():
+    script_dir = Path(__file__).resolve().parent
+    candidates = [
+        script_dir / "sweep_results",
+        script_dir / "sweep_results_10ghz_res",
+        script_dir / "sweep_results_6.9ghz_res",
+    ]
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+
+    available = sorted(
+        path.name for path in script_dir.iterdir()
+        if path.is_dir() and path.name.startswith("sweep_results")
+    )
+    raise FileNotFoundError(
+        "Could not find a sweep results directory next to the script. "
+        f"Looked for: {', '.join(str(path.name) for path in candidates)}. "
+        f"Available sweep result directories: {', '.join(available) or '(none)'}"
+    )
+
+
+RESULTS_DIR = default_results_dir()
 
 
 def parse_ltot_nh(folder_name):
@@ -73,6 +95,23 @@ def find_ltot_folder_by_nh(results_dir, ltot_nh):
     return matches[0]
 
 
+def default_ltot_nh(results_dir):
+    available = sorted(
+        parse_ltot_nh(path.name)
+        for path in results_dir.iterdir()
+        if path.is_dir() and path.name.startswith("Ltot_")
+    )
+    if not available:
+        raise FileNotFoundError(f"No Ltot_* folders found in {results_dir}")
+
+    preferred = [0.3, 0.03]
+    for target in preferred:
+        for value in available:
+            if np.isclose(value, target, rtol=0.0, atol=1e-12):
+                return value
+    return available[0]
+
+
 def find_sweep_csv(folder):
     matches = sorted(
         path
@@ -82,6 +121,10 @@ def find_sweep_csv(folder):
     if not matches:
         raise FileNotFoundError(f"No sweep CSV found in {folder}")
     return matches[0]
+
+
+def output_dir_for_results(results_dir):
+    return Path(results_dir).resolve() / DEFAULT_OUTPUT_SUBDIR
 
 
 def chi_mhz_from_row(row):
@@ -297,18 +340,21 @@ def make_plot(dataset, phi_mode, output_path):
 
 
 def main():
+    results_dir = Path(RESULTS_DIR).resolve()
+    ltot_nh = LTOT_NH if LTOT_NH is not None else default_ltot_nh(results_dir)
     dataset = collect_dataset(
-        results_dir=RESULTS_DIR,
-        ltot_nh=LTOT_NH,
+        results_dir=results_dir,
+        ltot_nh=ltot_nh,
         flux_values=FLUX_VALUES,
         beta_values=BETA_VALUES,
         phi_mode=PHI_MODE,
     )
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_dir = output_dir_for_results(results_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     safe_ltot = dataset[0]["folder"].replace(" ", "_")
-    plot_path = OUTPUT_DIR / f"chi_vs_beta_by_flux_{safe_ltot}.png"
-    summary_path = OUTPUT_DIR / f"chi_vs_beta_by_flux_{safe_ltot}_summary.csv"
+    plot_path = output_dir / f"chi_vs_beta_by_flux_{safe_ltot}.png"
+    summary_path = output_dir / f"chi_vs_beta_by_flux_{safe_ltot}_summary.csv"
 
     fig = make_plot(
         dataset=dataset,

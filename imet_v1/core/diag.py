@@ -2,9 +2,9 @@ import numpy as np
 import scqubits as scq
 
 # params given
-L_r  = 0.05e-9
-C_r  = 5.281e-12
-L_c  = 0.05e-9
+L_r  = 0.01e-9
+C_r  = 12.644e-12
+L_c  = 0.01e-9
 L_J1 = 30.0e-9
 L_J2 = 30.0e-9
 C_J1 = 40e-15
@@ -76,7 +76,7 @@ try:
 except Exception:
     cutoff_template = getattr(circ, "cutoffs", None) or getattr(circ, "truncation", None)
 
-print("\Cutoff template:")
+print("\nCutoff template:")
 print(cutoff_template)
 
 # External flux: use first flux variable if present (for get_spectrum)
@@ -117,19 +117,19 @@ f12 = evals_rel[2] - evals_rel[1]
 
 anharmonicity = f12 - f01
 
-omega_r = 1.0 / np.sqrt(L_r * C_r)
-f_res_bare = omega_r / (2 * np.pi) / 1e9 
+omega_r_lronly = 1.0 / np.sqrt(L_r * C_r)
+f_res_lronly = omega_r_lronly / (2 * np.pi) / 1e9
 
-detuning = f01 - f_res_bare
+omega_r_total = 1.0 / np.sqrt((L_r + L_c) * C_r)
+f_res_total = omega_r_total / (2 * np.pi) / 1e9
 
-
-f_r = 1/(2 * np.pi * np.sqrt(L_r + L_c) * C_r)
-print(f_r)
+detuning = f01 - f_res_total
 
 print("\nTransitions & nonlinearities (GHz):")
 print(f"f01 (ground→1) = {f01:.6f}")
 print(f"f12 (1 → 2) = {f12:.6f}")
 print(f"anharmonicity α=f12-f01 = {anharmonicity:.6f}")
 print("\nResonator & dispersive quantities (GHz):")
-print(f"bare resonator f_r = {f_res_bare:.6f}")
-print(f"detuning Δ = f01 - f_r = {detuning:.6f}")
+print(f"L_r-only resonator estimate = {f_res_lronly:.6f}")
+print(f"(L_r + L_c)-based resonator estimate = {f_res_total:.6f}")
+print(f"detuning Δ = f01 - f_r,total = {detuning:.6f}")

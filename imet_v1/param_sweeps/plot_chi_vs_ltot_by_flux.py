@@ -6,18 +6,40 @@ import numpy as np
 
 
 DEFAULT_FLUXES = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
-DEFAULT_RESULTS_DIR = Path(__file__).resolve().parent / "sweep_results"
-DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "plot_output"
+DEFAULT_OUTPUT_SUBDIR = "plot_output"
 CSV_GLOB = "imet_alpha_chi_vs_beta_flux*.csv"
-RESULTS_DIR = DEFAULT_RESULTS_DIR
-OUTPUT_DIR = DEFAULT_OUTPUT_DIR
 FLUX_VALUES = DEFAULT_FLUXES
-EXCLUDED_FOLDERS = ["Ltot_075"]
+EXCLUDED_FOLDERS = ["Ltot_075", "Ltot_0072"]
 SHOW_PLOT = False
 
 # Choose "fixed" for a beta slice or "max-abs-chi" for the envelope over beta.
 BETA_MODE = "fixed"
-BETA_VALUE = 0.6
+BETA_VALUE = 0.8
+
+
+def default_results_dir():
+    script_dir = Path(__file__).resolve().parent
+    candidates = [
+        script_dir / "sweep_results",
+        script_dir / "sweep_results_10ghz_res",
+        script_dir / "sweep_results_6.9ghz_res",
+    ]
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+
+    available = sorted(
+        path.name for path in script_dir.iterdir()
+        if path.is_dir() and path.name.startswith("sweep_results")
+    )
+    raise FileNotFoundError(
+        "Could not find a sweep results directory next to the script. "
+        f"Looked for: {', '.join(str(path.name) for path in candidates)}. "
+        f"Available sweep result directories: {', '.join(available) or '(none)'}"
+    )
+
+
+RESULTS_DIR = default_results_dir()
 
 
 def parse_ltot_nh(folder_name):
@@ -40,6 +62,10 @@ def find_sweep_csv(folder):
     if not matches:
         raise FileNotFoundError(f"No sweep CSV found in {folder}")
     return matches[0]
+
+
+def output_dir_for_results(results_dir):
+    return Path(results_dir).resolve() / DEFAULT_OUTPUT_SUBDIR
 
 
 def chi_mhz_from_row(row):
@@ -125,7 +151,10 @@ def collect_dataset(results_dir, excluded_folders, flux_values, beta_mode, beta_
             continue
 
         ltot_nh = parse_ltot_nh(folder.name)
-        csv_path = find_sweep_csv(folder)
+        try:
+            csv_path = find_sweep_csv(folder)
+        except FileNotFoundError:
+            continue
         rows = load_rows(csv_path)
 
         flux_points = []
@@ -217,17 +246,19 @@ def make_plot(dataset, beta_mode, beta_value, output_path):
 
 
 def main():
+    results_dir = Path(RESULTS_DIR).resolve()
     dataset = collect_dataset(
-        results_dir=RESULTS_DIR,
+        results_dir=results_dir,
         excluded_folders=EXCLUDED_FOLDERS,
         flux_values=FLUX_VALUES,
         beta_mode=BETA_MODE,
         beta_value=BETA_VALUE,
     )
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    plot_path = OUTPUT_DIR / "chi_vs_ltot_by_flux.png"
-    summary_path = OUTPUT_DIR / "chi_vs_ltot_by_flux_summary.csv"
+    output_dir = output_dir_for_results(results_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    plot_path = output_dir / "chi_vs_ltot_by_flux.png"
+    summary_path = output_dir / "chi_vs_ltot_by_flux_summary.csv"
 
     fig = make_plot(
         dataset=dataset,

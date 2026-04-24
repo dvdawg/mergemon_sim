@@ -128,17 +128,17 @@ def energy_of_label(assignments, nq, nr):
 if __name__ == "__main__":
     import scqubits as scq
 
-    L_r  = 0.05e-9
-    C_r  = 3.5e-12
-    L_c  = 0.02e-9
+    L_r  = 0.1259915e-9
+    C_r  = 1.0e-12
+    L_c  = 0.1259915e-9
     L_J1 = 30.0e-9
     L_J2 = 30.0e-9
     C_J1 = 40e-15
     C_J2 = 40e-15
 
-    PHI0     = 2.067833848e-15
+    PHI0 = 2.067833848e-15
     E_CHARGE = 1.602176634e-19
-    H        = 6.62607015e-34
+    H = 6.62607015e-34
 
     def _inductive_energy_ghz(L_H):
         return ((PHI0 / (2 * np.pi)) ** 2 / L_H) / (H * 1e9)

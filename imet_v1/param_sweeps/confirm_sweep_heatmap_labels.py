@@ -13,9 +13,9 @@ TITLE_FONTSIZE = 14
 LEGEND_FONTSIZE = 10
 SUPTITLE_FONTSIZE = 18
 
-L_r = 0.264e-9
-C_r = 0.878e-12
-L_c = 0.396e-9
+L_r = 0.035e-9
+C_r = 3.612831e-12
+L_c = 0.035e-9
 L_J1 = 30.0e-9
 L_J2 = 30.0e-9
 C_J1 = 40e-15
